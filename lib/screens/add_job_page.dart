@@ -1,139 +1,169 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
 class AddJobPage extends StatefulWidget {
-  const AddJobPage({super.key});
+  final bool isAdmin;
+  const AddJobPage({super.key, this.isAdmin = false});
 
   @override
-  State createState() => _AddJobPageState();
+  State<AddJobPage> createState() => _AddJobPageState();
 }
 
 class _AddJobPageState extends State<AddJobPage> {
   final _formKey = GlobalKey<FormState>();
 
-  // Controllers
-  final _jobId = TextEditingController();
-  final _pickupAddress = TextEditingController();
-  final _dropoffAddress = TextEditingController();
-  final _customerName = TextEditingController();
-  final _customerPhone = TextEditingController();
-  final _passengerCount = TextEditingController();
-  final _luggage = TextEditingController();
-  final _price = TextEditingController();
-  final _flightDetails = TextEditingController();
-  final _notes = TextEditingController();
+  // Core fields
+  final _pickupAddressCtrl = TextEditingController();
+  final _dropoffAddressCtrl = TextEditingController();
+  final _notesCtrl = TextEditingController();
+  final _passengerCountCtrl = TextEditingController();
+  final _flightDetailsCtrl = TextEditingController();
 
-  // Date + Time
-  DateTime? _pickupDate;
-  TimeOfDay? _pickupTime;
+  // Pickup date/time stored as strings (matching your existing job format)
+  final _pickupDateCtrl = TextEditingController();
+  final _pickupTimeCtrl = TextEditingController();
 
+  // Price (only required for fixed)
+  final _priceCtrl = TextEditingController();
+
+  String _pricingType = 'fixed'; // fixed | tender
   bool _saving = false;
-
-  // NEW: pricing type
-  String _pricingType = 'fixed'; // 'fixed' | 'tender'
 
   @override
   void dispose() {
-    _jobId.dispose();
-    _pickupAddress.dispose();
-    _dropoffAddress.dispose();
-    _customerName.dispose();
-    _customerPhone.dispose();
-    _passengerCount.dispose();
-    _luggage.dispose();
-    _price.dispose();
-    _flightDetails.dispose();
-    _notes.dispose();
+    _pickupAddressCtrl.dispose();
+    _dropoffAddressCtrl.dispose();
+    _notesCtrl.dispose();
+    _passengerCountCtrl.dispose();
+    _flightDetailsCtrl.dispose();
+    _pickupDateCtrl.dispose();
+    _pickupTimeCtrl.dispose();
+    _priceCtrl.dispose();
     super.dispose();
   }
 
-  String _formatDate(DateTime d) {
-    final dd = d.day.toString().padLeft(2, '0');
-    final mm = d.month.toString().padLeft(2, '0');
-    final yyyy = d.year.toString();
-    return '$dd/$mm/$yyyy';
-  }
+  String _s(dynamic v) => (v ?? '').toString().trim();
 
-  String _formatTime(TimeOfDay t) {
-    final hh = t.hour.toString().padLeft(2, '0');
-    final mm = t.minute.toString().padLeft(2, '0');
-    return '$hh:$mm';
-  }
-
-  DateTime _combineDateTime(DateTime date, TimeOfDay time) {
-    return DateTime(date.year, date.month, date.day, time.hour, time.minute);
+  num? _parseMoney(String input) {
+    final cleaned = input.replaceAll('£', '').trim();
+    if (cleaned.isEmpty) return null;
+    return num.tryParse(cleaned);
   }
 
   Future<void> _pickDate() async {
     final now = DateTime.now();
+    final initial = now;
     final picked = await showDatePicker(
       context: context,
-      initialDate: _pickupDate ?? now,
+      initialDate: initial,
       firstDate: DateTime(now.year - 1),
       lastDate: DateTime(now.year + 5),
     );
-    if (picked != null) setState(() => _pickupDate = picked);
+
+    if (picked == null) return;
+
+    // Store as dd/MM/yyyy (simple UK style)
+    final dd = picked.day.toString().padLeft(2, '0');
+    final mm = picked.month.toString().padLeft(2, '0');
+    final yyyy = picked.year.toString();
+    _pickupDateCtrl.text = '$dd/$mm/$yyyy';
+    setState(() {});
   }
 
   Future<void> _pickTime() async {
+    final now = TimeOfDay.now();
     final picked = await showTimePicker(
       context: context,
-      initialTime: _pickupTime ?? TimeOfDay.now(),
+      initialTime: now,
     );
-    if (picked != null) setState(() => _pickupTime = picked);
+
+    if (picked == null) return;
+
+    final hh = picked.hour.toString().padLeft(2, '0');
+    final mm = picked.minute.toString().padLeft(2, '0');
+    _pickupTimeCtrl.text = '$hh:$mm';
+    setState(() {});
   }
 
   Future<void> _saveJob() async {
-    if (!_formKey.currentState!.validate()) return;
-
-    if (_pickupDate == null || _pickupTime == null) {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please select pickup date and time')),
+        const SnackBar(content: Text('You are not signed in.')),
       );
       return;
     }
 
+    final valid = _formKey.currentState?.validate() ?? false;
+    if (!valid) return;
+
     setState(() => _saving = true);
 
     try {
-      final pickupAt = _combineDateTime(_pickupDate!, _pickupTime!);
+      final jobs = FirebaseFirestore.instance.collection('jobs');
+      final docRef = jobs.doc(); // create ID first so we can store it as jobId
 
-      final isTender = _pricingType == 'tender';
-      final fixedPrice = isTender ? null : (double.tryParse(_price.text.trim()) ?? 0.0);
+      final pickupAddress = _s(_pickupAddressCtrl.text);
+      final dropoffAddress = _s(_dropoffAddressCtrl.text);
+      final pickupDate = _s(_pickupDateCtrl.text);
+      final pickupTime = _s(_pickupTimeCtrl.text);
+      final notes = _s(_notesCtrl.text);
+      final pax = _s(_passengerCountCtrl.text);
+      final flight = _s(_flightDetailsCtrl.text);
 
-      final doc = await FirebaseFirestore.instance.collection('jobs').add({
-        'jobId': _jobId.text.trim(),
-        'pickupDate': _formatDate(_pickupDate!),
-        'pickupTime': _formatTime(_pickupTime!),
-        'pickupAt': Timestamp.fromDate(pickupAt),
+      num? price;
+      if (_pricingType == 'fixed') {
+        price = _parseMoney(_priceCtrl.text);
+      } else {
+        price = null; // tender: driver bids, dispatcher awards and sets price later
+      }
 
-        'pickupAddress': _pickupAddress.text.trim(),
-        'dropoffAddress': _dropoffAddress.text.trim(),
-        'customerName': _customerName.text.trim(),
-        'customerPhone': _customerPhone.text.trim(),
-        'passengerCount': int.tryParse(_passengerCount.text.trim()) ?? 0,
-        'luggage': _luggage.text.trim(),
-        'flightDetails': _flightDetails.text.trim(),
-        'notes': _notes.text.trim(),
-
-        // NEW:
-        'pricingType': _pricingType, // 'fixed' | 'tender'
-        'price': fixedPrice,         // keep field for fixed jobs, null for tender
+      await docRef.set({
+        'jobId': docRef.id,
 
         'status': 'new',
+        'pricingType': _pricingType, // "fixed" | "tender"
+
+        'pickupAddress': pickupAddress,
+        'dropoffAddress': dropoffAddress,
+        'pickupDate': pickupDate,
+        'pickupTime': pickupTime,
+
+        // optional details
+        if (notes.isNotEmpty) 'notes': notes,
+        if (pax.isNotEmpty) 'passengerCount': pax,
+        if (flight.isNotEmpty) 'flightDetails': flight,
+
+        // price only for fixed jobs
+        'price': price,
+
+        // assignment fields
         'assignedDriverId': null,
+        'assignedDriverName': null,
+
+        // auditing
         'createdAt': FieldValue.serverTimestamp(),
+        'createdBy': user.uid,
+        'createdByEmail': user.email ?? '',
       });
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Job created (${doc.id})')),
+        SnackBar(
+          content: Text(
+            _pricingType == 'fixed'
+                ? 'Fixed job created'
+                : 'Tender job created (drivers can bid)',
+          ),
+        ),
       );
+
       Navigator.pop(context);
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error creating job: $e')),
+        SnackBar(content: Text('Save failed: $e')),
       );
     } finally {
       if (mounted) setState(() => _saving = false);
@@ -142,134 +172,191 @@ class _AddJobPageState extends State<AddJobPage> {
 
   @override
   Widget build(BuildContext context) {
-    final dateText = _pickupDate == null ? 'Select date' : _formatDate(_pickupDate!);
-    final timeText = _pickupTime == null ? 'Select time' : _formatTime(_pickupTime!);
-
-    final isTender = _pricingType == 'tender';
+    final title = widget.isAdmin ? 'Add Job (Admin)' : 'Add Job';
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Add Job')),
-      body: AbsorbPointer(
-        absorbing: _saving,
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(16),
-          child: Form(
-            key: _formKey,
-            child: Column(
-              children: [
-                TextFormField(
-                  controller: _jobId,
-                  decoration: const InputDecoration(labelText: 'Job ID (letters/numbers)'),
-                  validator: (v) => (v == null || v.trim().isEmpty) ? 'Required' : null,
-                ),
-                const SizedBox(height: 12),
+      appBar: AppBar(
+        title: Text(title),
+      ),
+      body: SafeArea(
+        child: Form(
+          key: _formKey,
+          child: ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              // Pricing type selector
+              Row(
+                children: [
+                  const Text(
+                    'Pricing:',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(width: 12),
+                  DropdownButton<String>(
+                    value: _pricingType,
+                    items: const [
+                      DropdownMenuItem(value: 'fixed', child: Text('Fixed price')),
+                      DropdownMenuItem(value: 'tender', child: Text('Tender (drivers bid)')),
+                    ],
+                    onChanged: _saving
+                        ? null
+                        : (v) {
+                      if (v == null) return;
+                      setState(() {
+                        _pricingType = v;
+                        if (_pricingType == 'tender') {
+                          _priceCtrl.clear();
+                        }
+                      });
+                    },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
 
-                // NEW: pricing type selector
-                DropdownButtonFormField<String>(
-                  value: _pricingType,
-                  decoration: const InputDecoration(labelText: 'Pricing type'),
-                  items: const [
-                    DropdownMenuItem(value: 'fixed', child: Text('Fixed price (drivers accept)')),
-                    DropdownMenuItem(value: 'tender', child: Text('Tender (drivers bid a price)')),
-                  ],
-                  onChanged: (v) => setState(() => _pricingType = v ?? 'fixed'),
+              TextFormField(
+                controller: _pickupAddressCtrl,
+                textInputAction: TextInputAction.next,
+                decoration: const InputDecoration(
+                  labelText: 'Pickup address',
+                  border: OutlineInputBorder(),
                 ),
+                validator: (v) {
+                  if (_s(v).isEmpty) return 'Pickup address is required';
+                  return null;
+                },
+              ),
+              const SizedBox(height: 12),
 
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton(onPressed: _pickDate, child: Text(dateText)),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: OutlinedButton(onPressed: _pickTime, child: Text(timeText)),
-                    ),
-                  ],
+              TextFormField(
+                controller: _dropoffAddressCtrl,
+                textInputAction: TextInputAction.next,
+                decoration: const InputDecoration(
+                  labelText: 'Drop-off address',
+                  border: OutlineInputBorder(),
                 ),
+                validator: (v) {
+                  if (_s(v).isEmpty) return 'Drop-off address is required';
+                  return null;
+                },
+              ),
+              const SizedBox(height: 12),
 
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _pickupAddress,
-                  decoration: const InputDecoration(labelText: 'Pickup Address'),
-                  validator: (v) => (v == null || v.trim().isEmpty) ? 'Required' : null,
-                ),
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _dropoffAddress,
-                  decoration: const InputDecoration(labelText: 'Drop-off Address'),
-                  validator: (v) => (v == null || v.trim().isEmpty) ? 'Required' : null,
-                ),
-
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _customerName,
-                  decoration: const InputDecoration(labelText: 'Customer Name'),
-                ),
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _customerPhone,
-                  decoration: const InputDecoration(labelText: 'Customer Number'),
-                ),
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _passengerCount,
-                  decoration: const InputDecoration(labelText: 'Passenger Count'),
-                  keyboardType: TextInputType.number,
-                ),
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _luggage,
-                  decoration: const InputDecoration(labelText: 'Luggage Details'),
-                ),
-
-                const SizedBox(height: 12),
-
-                // Price only for fixed jobs
-                if (!isTender)
-                  TextFormField(
-                    controller: _price,
-                    decoration: const InputDecoration(labelText: 'Fixed Price'),
-                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                    validator: (v) => (v == null || v.trim().isEmpty) ? 'Required' : null,
-                  )
-                else
-                  const Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text(
-                      'Tender job: drivers will submit their own price.',
-                      style: TextStyle(fontSize: 13),
+              // Date / Time pickers
+              Row(
+                children: [
+                  Expanded(
+                    child: TextFormField(
+                      controller: _pickupDateCtrl,
+                      readOnly: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Pickup date',
+                        border: OutlineInputBorder(),
+                        suffixIcon: Icon(Icons.calendar_today),
+                      ),
+                      onTap: _saving ? null : _pickDate,
+                      validator: (v) {
+                        if (_s(v).isEmpty) return 'Pickup date is required';
+                        return null;
+                      },
                     ),
                   ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: TextFormField(
+                      controller: _pickupTimeCtrl,
+                      readOnly: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Pickup time',
+                        border: OutlineInputBorder(),
+                        suffixIcon: Icon(Icons.access_time),
+                      ),
+                      onTap: _saving ? null : _pickTime,
+                      validator: (v) {
+                        if (_s(v).isEmpty) return 'Pickup time is required';
+                        return null;
+                      },
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
 
-                const SizedBox(height: 12),
+              // Price only for fixed
+              if (_pricingType == 'fixed') ...[
                 TextFormField(
-                  controller: _flightDetails,
-                  decoration: const InputDecoration(labelText: 'Flight Details'),
+                  controller: _priceCtrl,
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  decoration: const InputDecoration(
+                    labelText: 'Price (£)',
+                    border: OutlineInputBorder(),
+                    hintText: 'e.g. 35 or 35.00',
+                  ),
+                  validator: (v) {
+                    final n = _parseMoney(_s(v));
+                    if (n == null || n <= 0) return 'Enter a valid price';
+                    return null;
+                  },
                 ),
                 const SizedBox(height: 12),
-                TextFormField(
-                  controller: _notes,
-                  decoration: const InputDecoration(labelText: 'Other Details / Notes'),
-                  maxLines: 3,
-                ),
-
-                const SizedBox(height: 18),
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton(
-                    onPressed: _saveJob,
-                    child: _saving
-                        ? const SizedBox(
-                      height: 18,
-                      width: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                        : const Text('Create Job'),
+              ] else ...[
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.black12),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Text(
+                    'Tender job: drivers will submit their own price.\n'
+                        'You will award it from the Tender Jobs tab.',
                   ),
                 ),
+                const SizedBox(height: 12),
               ],
-            ),
+
+              // Optional extras
+              TextFormField(
+                controller: _passengerCountCtrl,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: 'Passengers (optional)',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+
+              TextFormField(
+                controller: _flightDetailsCtrl,
+                decoration: const InputDecoration(
+                  labelText: 'Flight details (optional)',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+
+              TextFormField(
+                controller: _notesCtrl,
+                minLines: 2,
+                maxLines: 4,
+                decoration: const InputDecoration(
+                  labelText: 'Notes (optional)',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 18),
+
+              ElevatedButton.icon(
+                onPressed: _saving ? null : _saveJob,
+                icon: _saving
+                    ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+                    : const Icon(Icons.save),
+                label: Text(_saving ? 'Saving…' : 'Create Job'),
+              ),
+            ],
           ),
         ),
       ),
