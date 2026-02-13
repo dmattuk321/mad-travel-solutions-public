@@ -1,0 +1,63 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+
+    function role() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(uid()))
+        ? get(/databases/$(database)/documents/users/$(uid())).data.role
+        : null;
+    }
+
+    function isAdmin() { return role() == "admin"; }
+    function isDispatcher() { return role() == "dispatcher"; }
+    function isDriver() { return role() == "driver"; }
+    function isStaff() { return isAdmin() || isDispatcher(); }
+
+    // ---------------- USERS ----------------
+    // (Keep your existing setup: only staff manage roles)
+    match /users/{userId} {
+      allow read: if signedIn() && (userId == uid() || isStaff());
+      allow create, update, delete: if signedIn() && isStaff();
+    }
+
+    // ---------------- JOBS ----------------
+    match /jobs/{jobId} {
+
+      // Everyone signed in can read jobs (drivers need Available + My Jobs)
+      allow read: if signedIn();
+
+      // Only staff can create/delete jobs
+      allow create, delete: if signedIn() && isStaff();
+
+      // Updates allowed if:
+      // - staff (any edit)
+      // - driver accepting an unassigned "new" job
+      // - driver updating status on their own job
+      allow update: if signedIn() && (
+        isStaff()
+        || driverAccepting()
+        || driverUpdatingOwnJob()
+      );
+
+      // Driver can accept ONLY if job is new + unassigned, and they assign it to themselves.
+      function driverAccepting() {
+        return isDriver()
+          && resource.data.status == "new"
+          && resource.data.assignedDriverId == null
+          && request.resource.data.assignedDriverId == uid()
+          && request.resource.data.status == "accepted";
+      }
+
+      // Driver can update ONLY jobs assigned to them (status changes etc)
+      function driverUpdatingOwnJob() {
+        return isDriver()
+          && resource.data.assignedDriverId == uid()
+          && request.resource.data.assignedDriverId == uid();
+      }
+    }
+  }
+}
