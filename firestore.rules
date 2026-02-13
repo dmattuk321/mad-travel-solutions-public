@@ -15,7 +15,7 @@ service cloud.firestore {
     }
 
     function role() {
-      return signedIn() && userDoc().exists ? userDoc().data.role : null;
+      return signedIn() && userDoc().exists() ? userDoc().data.role : null;
     }
 
     function isAdmin() {
@@ -120,7 +120,7 @@ service cloud.firestore {
         }
 
         function parentIsOpenForBids() {
-          return parentJob().exists
+          return parentJob().exists()
             && parentJob().data.status == "new"
             && parentJob().data.assignedDriverId == null;
         }
