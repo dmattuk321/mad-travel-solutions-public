@@ -36,8 +36,20 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     return s.startsWith('£') ? s : '£$s';
   }
 
+  num? _parsePrice(String input) {
+    final cleaned = input.replaceAll('£', '').trim();
+    if (cleaned.isEmpty) return null;
+    return num.tryParse(cleaned);
+  }
+
+  bool _isTender(Map<String, dynamic> job) {
+    final pt = _s(job['pricingType']).toLowerCase(); // "fixed" or "tender"
+    if (pt == 'tender') return true;
+    if (job['isTender'] == true) return true; // backward compat
+    return false;
+  }
+
   String _compactDateTime(Map<String, dynamic> job) {
-    // Your jobs use strings like pickupDate / pickupTime (from Add Job screen)
     final date = _s(job['pickupDate']);
     final time = _s(job['pickupTime']);
     if (date.isEmpty && time.isEmpty) return '';
@@ -47,7 +59,6 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
   }
 
   String _getAddress(Map<String, dynamic> job, String key) {
-    // supports either flat field e.g. pickupAddress OR nested map pickup.address
     final flat = _s(job[key]);
     if (flat.isNotEmpty) return flat;
 
@@ -59,40 +70,81 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     return '';
   }
 
-  Future<void> _acceptJob(String docId, Map<String, dynamic> job) async {
+  Future<void> _acceptJob(String docId) async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
 
     final ref = FirebaseFirestore.instance.collection('jobs').doc(docId);
 
-    await FirebaseFirestore.instance.runTransaction((tx) async {
-      final snap = await tx.get(ref);
-      if (!snap.exists) return;
+    try {
+      await FirebaseFirestore.instance.runTransaction((tx) async {
+        final snap = await tx.get(ref);
+        if (!snap.exists) return;
 
-      final data = snap.data() as Map<String, dynamic>;
-      final currentStatus = _s(data['status']);
-      final assigned = data['assignedDriverId'];
+        final data = snap.data() as Map<String, dynamic>;
+        final currentStatus = _s(data['status']);
+        final assigned = data['assignedDriverId'];
 
-      // Only accept if truly unassigned & new
-      if (currentStatus != 'new') return;
-      if (assigned != null) return;
+        // Only accept if truly unassigned & new
+        if (currentStatus != 'new') return;
+        if (assigned != null) return;
 
-      tx.update(ref, {
-        'assignedDriverId': user.uid,
-        'assignedDriverName': _s(user.email),
-        'status': 'accepted',
-        'acceptedAt': FieldValue.serverTimestamp(),
+        tx.update(ref, {
+          'assignedDriverId': user.uid,
+          'assignedDriverName': _s(user.email),
+          'status': 'accepted',
+          'acceptedAt': FieldValue.serverTimestamp(),
+        });
       });
-    });
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Accept failed: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _submitBid({
+    required String jobId,
+    required num price,
+  }) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    final bidRef = FirebaseFirestore.instance
+        .collection('jobs')
+        .doc(jobId)
+        .collection('bids')
+        .doc(user.uid);
+
+    try {
+      await bidRef.set({
+        'driverId': user.uid,
+        'driverName': _s(user.email),
+        'price': price,
+        'updatedAt': FieldValue.serverTimestamp(),
+        'createdAt': FieldValue.serverTimestamp(), // overwritten first time, harmless later
+      }, SetOptions(merge: true));
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Bid submitted: £${price.toStringAsFixed(2)}')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Bid failed: $e')),
+        );
+      }
+    }
   }
 
   bool _canMoveTo(String current, String target) {
     if (!_statuses.contains(target)) return false;
 
-    // current could be 'new' for edge cases
-    if (current == 'new') {
-      return target == 'accepted';
-    }
+    if (current == 'new') return target == 'accepted';
 
     final currentIndex = _statuses.indexOf(current);
     if (currentIndex == -1) return false;
@@ -100,7 +152,6 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     final targetIndex = _statuses.indexOf(target);
     if (targetIndex == -1) return false;
 
-    // forward-only (skips allowed)
     return targetIndex >= currentIndex;
   }
 
@@ -114,10 +165,18 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
       'completed': 'completedAt',
     }[targetStatus];
 
-    await ref.update({
-      'status': targetStatus,
-      if (tsField != null) tsField: FieldValue.serverTimestamp(),
-    });
+    try {
+      await ref.update({
+        'status': targetStatus,
+        if (tsField != null) tsField: FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Status update failed: $e')),
+        );
+      }
+    }
   }
 
   Widget _jobHeaderLine(Map<String, dynamic> job) {
@@ -154,7 +213,6 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
   }
 
   Widget _statusButtons(String docId, String currentStatus) {
-    // If current is 'new', driver shouldn't see these here (only after accept)
     if (currentStatus == 'new') return const SizedBox.shrink();
 
     return Wrap(
@@ -172,7 +230,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     );
   }
 
-  // ----------- UI: Available Jobs -----------
+  // ---------------- Available Jobs ----------------
   Widget _availableJobsTab() {
     final query = FirebaseFirestore.instance
         .collection('jobs')
@@ -201,6 +259,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
           itemBuilder: (context, i) {
             final doc = docs[i];
             final job = doc.data();
+            final tender = _isTender(job);
 
             return Card(
               margin: const EdgeInsets.symmetric(vertical: 8),
@@ -213,13 +272,21 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
                     const SizedBox(height: 10),
                     _jobSummary(job),
                     const SizedBox(height: 12),
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: ElevatedButton(
-                        onPressed: () => _acceptJob(doc.id, job),
-                        child: const Text('Accept Job'),
+
+                    if (!tender)
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: ElevatedButton(
+                          onPressed: () => _acceptJob(doc.id),
+                          child: const Text('Accept Job'),
+                        ),
+                      )
+                    else
+                      _TenderBidBox(
+                        jobId: doc.id,
+                        onSubmit: (price) => _submitBid(jobId: doc.id, price: price),
+                        parsePrice: _parsePrice,
                       ),
-                    ),
                   ],
                 ),
               ),
@@ -230,7 +297,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     );
   }
 
-  // ----------- UI: My Jobs (Expandable full details + status buttons) -----------
+  // ---------------- My Jobs ----------------
   Widget _myJobsTab() {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
@@ -311,6 +378,108 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
           _myJobsTab(),
         ],
       ),
+    );
+  }
+}
+
+class _TenderBidBox extends StatefulWidget {
+  final String jobId;
+  final Future<void> Function(num price) onSubmit;
+  final num? Function(String input) parsePrice;
+
+  const _TenderBidBox({
+    required this.jobId,
+    required this.onSubmit,
+    required this.parsePrice,
+  });
+
+  @override
+  State<_TenderBidBox> createState() => _TenderBidBoxState();
+}
+
+class _TenderBidBoxState extends State<_TenderBidBox> {
+  final _controller = TextEditingController();
+  bool _busy = false;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser;
+
+    if (user == null) {
+      return const Text('Not signed in.');
+    }
+
+    final bidDocStream = FirebaseFirestore.instance
+        .collection('jobs')
+        .doc(widget.jobId)
+        .collection('bids')
+        .doc(user.uid)
+        .snapshots();
+
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: bidDocStream,
+      builder: (context, snap) {
+        final hasBid = snap.data?.exists ?? false;
+        final bidData = snap.data?.data();
+        final bidPrice = bidData?['price'];
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            if (hasBid && bidPrice != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                  'Your bid: £${(bidPrice as num).toStringAsFixed(2)}',
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _controller,
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    decoration: const InputDecoration(
+                      labelText: 'Your price (£)',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                ElevatedButton(
+                  onPressed: _busy
+                      ? null
+                      : () async {
+                    final parsed = widget.parsePrice(_controller.text);
+                    if (parsed == null || parsed <= 0) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Enter a valid price')),
+                      );
+                      return;
+                    }
+                    setState(() => _busy = true);
+                    try {
+                      await widget.onSubmit(parsed);
+                    } finally {
+                      if (mounted) setState(() => _busy = false);
+                    }
+                  },
+                  child: Text(hasBid ? 'Update Bid' : 'Submit Bid'),
+                ),
+              ],
+            ),
+          ],
+        );
+      },
     );
   }
 }
