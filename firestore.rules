@@ -54,7 +54,7 @@ service cloud.firestore {
 
       // Updates allowed if:
       // - admin/dispatcher
-      // - driver accepting an unassigned new job
+      // - driver accepting an unassigned new job (fixed price jobs)
       // - driver updating status on their own job (forward-only)
       allow update: if signedIn() && (
         isAdminOrDispatcher()
@@ -86,10 +86,8 @@ service cloud.firestore {
 
       function isValidForwardStatus(oldStatus, newStatus) {
         return
-          // allow staying the same (no change)
           (newStatus == oldStatus)
           ||
-          // accepted -> started/arrived/pob/completed
           (oldStatus == "accepted" && (
             newStatus == "started" ||
             newStatus == "arrived" ||
@@ -97,20 +95,17 @@ service cloud.firestore {
             newStatus == "completed"
           ))
           ||
-          // started -> arrived/pob/completed
           (oldStatus == "started" && (
             newStatus == "arrived" ||
             newStatus == "pob" ||
             newStatus == "completed"
           ))
           ||
-          // arrived -> pob/completed
           (oldStatus == "arrived" && (
             newStatus == "pob" ||
             newStatus == "completed"
           ))
           ||
-          // pob -> completed
           (oldStatus == "pob" && (
             newStatus == "completed"
           ));
@@ -120,16 +115,32 @@ service cloud.firestore {
       // Stored under: /jobs/{jobId}/bids/{driverUid}
       match /bids/{bidId} {
 
+        function parentJob() {
+          return get(/databases/$(database)/documents/jobs/$(jobId));
+        }
+
+        function parentIsOpenForBids() {
+          return parentJob().exists
+            && parentJob().data.status == "new"
+            && parentJob().data.assignedDriverId == null;
+        }
+
         // Admin/Dispatcher can read all bids
-        allow read: if signedIn() && isAdminOrDispatcher();
+        // Driver can read ONLY their own bid
+        allow read: if signedIn() && (
+          isAdminOrDispatcher()
+          || (isDriver() && bidId == uid())
+        );
 
         // Driver can create/update ONLY their own bid document
         // We enforce:
         // - bidId must equal the driver's uid
         // - driverId must match auth uid
         // - price must be a positive number
+        // - job must still be open/unassigned/new
         allow create, update: if signedIn()
           && isDriver()
+          && parentIsOpenForBids()
           && bidId == uid()
           && request.resource.data.driverId == uid()
           && request.resource.data.price is number
@@ -141,4 +152,3 @@ service cloud.firestore {
     }
   }
 }
-
