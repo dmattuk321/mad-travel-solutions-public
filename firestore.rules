@@ -43,7 +43,7 @@ service cloud.firestore {
     // ---------- JOBS ----------
     match /jobs/{jobId} {
 
-      // Any signed-in user can read jobs (driver needs Available Jobs + My Jobs)
+      // Any signed-in user can read jobs
       allow read: if signedIn();
 
       // Only admin/dispatcher can create jobs
@@ -133,11 +133,6 @@ service cloud.firestore {
         );
 
         // Driver can create/update ONLY their own bid document
-        // We enforce:
-        // - bidId must equal the driver's uid
-        // - driverId must match auth uid
-        // - price must be a positive number
-        // - job must still be open/unassigned/new
         allow create, update: if signedIn()
           && isDriver()
           && parentIsOpenForBids()
@@ -146,7 +141,7 @@ service cloud.firestore {
           && request.resource.data.price is number
           && request.resource.data.price > 0;
 
-        // No deleting bids (keeps it simple)
+        // No deleting bids
         allow delete: if false;
       }
     }
