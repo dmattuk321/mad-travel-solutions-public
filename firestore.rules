@@ -5,10 +5,13 @@ service cloud.firestore {
     function signedIn() { return request.auth != null; }
     function uid() { return request.auth.uid; }
 
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(uid()));
+    }
+
     function role() {
-      return signedIn()
-        && exists(/databases/$(database)/documents/users/$(uid()))
-        ? get(/databases/$(database)/documents/users/$(uid())).data.role
+      return signedIn() && exists(/databases/$(database)/documents/users/$(uid()))
+        ? userDoc().data.role
         : null;
     }
 
@@ -17,46 +20,71 @@ service cloud.firestore {
     function isDriver() { return role() == "driver"; }
     function isStaff() { return isAdmin() || isDispatcher(); }
 
-    // ---------------- USERS ----------------
-    // (Keep your existing setup: only staff manage roles)
+    // ---------- USERS ----------
     match /users/{userId} {
       allow read: if signedIn() && (userId == uid() || isStaff());
       allow create, update, delete: if signedIn() && isStaff();
     }
 
-    // ---------------- JOBS ----------------
+    // ---------- JOBS ----------
     match /jobs/{jobId} {
 
-      // Everyone signed in can read jobs (drivers need Available + My Jobs)
-      allow read: if signedIn();
-
-      // Only staff can create/delete jobs
-      allow create, delete: if signedIn() && isStaff();
-
-      // Updates allowed if:
-      // - staff (any edit)
-      // - driver accepting an unassigned "new" job
-      // - driver updating status on their own job
-      allow update: if signedIn() && (
+      // Staff can read all.
+      // Drivers can read:
+      //  - unassigned new jobs (available + tender listings)
+      //  - jobs assigned to them (my jobs)
+      allow read: if signedIn() && (
         isStaff()
-        || driverAccepting()
-        || driverUpdatingOwnJob()
+        || (isDriver() && (
+          (resource.data.status == "new" && resource.data.assignedDriverId == null)
+          || (resource.data.assignedDriverId == uid())
+        ))
       );
 
-      // Driver can accept ONLY if job is new + unassigned, and they assign it to themselves.
-      function driverAccepting() {
+      allow create, delete: if signedIn() && isStaff();
+
+      // Staff can update anything.
+      // Drivers can:
+      //  - accept set-price jobs that are new+unassigned
+      //  - update status on their own assigned jobs
+      allow update: if signedIn() && (
+        isStaff()
+        || driverAcceptingSetJob()
+        || driverUpdatingOwnStatus()
+      );
+
+      function driverAcceptingSetJob() {
         return isDriver()
           && resource.data.status == "new"
           && resource.data.assignedDriverId == null
+          && resource.data.jobType == "set"
           && request.resource.data.assignedDriverId == uid()
           && request.resource.data.status == "accepted";
       }
 
-      // Driver can update ONLY jobs assigned to them (status changes etc)
-      function driverUpdatingOwnJob() {
+      function driverUpdatingOwnStatus() {
         return isDriver()
           && resource.data.assignedDriverId == uid()
           && request.resource.data.assignedDriverId == uid();
+      }
+
+      // ---------- BIDS (tender jobs) ----------
+      match /bids/{bidId} {
+        // Only staff can read all bids.
+        // Drivers can read only their own bid doc.
+        allow read: if signedIn() && (isStaff() || (isDriver() && bidId == uid()));
+
+        // Drivers can create/update only their own bid doc,
+        // and only while the job is still new+unassigned+tender.
+        allow create, update: if signedIn()
+          && isDriver()
+          && bidId == uid()
+          && get(/databases/$(database)/documents/jobs/$(jobId)).data.jobType == "tender"
+          && get(/databases/$(database)/documents/jobs/$(jobId)).data.status == "new"
+          && get(/databases/$(database)/documents/jobs/$(jobId)).data.assignedDriverId == null;
+
+        // Only staff can delete bids (optional)
+        allow delete: if signedIn() && isStaff();
       }
     }
   }
