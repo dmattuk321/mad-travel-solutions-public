@@ -2,90 +2,143 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    function signedIn() { return request.auth != null; }
-    function uid() { return request.auth.uid; }
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
 
     function userDoc() {
       return get(/databases/$(database)/documents/users/$(uid()));
     }
 
     function role() {
-      return signedIn() && exists(/databases/$(database)/documents/users/$(uid()))
-        ? userDoc().data.role
-        : null;
+      return signedIn() && userDoc().exists ? userDoc().data.role : null;
     }
 
-    function isAdmin() { return role() == "admin"; }
-    function isDispatcher() { return role() == "dispatcher"; }
-    function isDriver() { return role() == "driver"; }
-    function isStaff() { return isAdmin() || isDispatcher(); }
+    function isAdmin() {
+      return role() == "admin";
+    }
+
+    function isDispatcher() {
+      return role() == "dispatcher";
+    }
+
+    function isDriver() {
+      return role() == "driver";
+    }
+
+    function isAdminOrDispatcher() {
+      return isAdmin() || isDispatcher();
+    }
 
     // ---------- USERS ----------
     match /users/{userId} {
-      allow read: if signedIn() && (userId == uid() || isStaff());
-      allow create, update, delete: if signedIn() && isStaff();
+      allow read: if signedIn() && (userId == uid() || isAdminOrDispatcher());
+      allow create, update, delete: if signedIn() && isAdminOrDispatcher();
     }
 
     // ---------- JOBS ----------
     match /jobs/{jobId} {
 
-      // Staff can read all.
-      // Drivers can read:
-      //  - unassigned new jobs (available + tender listings)
-      //  - jobs assigned to them (my jobs)
-      allow read: if signedIn() && (
-        isStaff()
-        || (isDriver() && (
-          (resource.data.status == "new" && resource.data.assignedDriverId == null)
-          || (resource.data.assignedDriverId == uid())
-        ))
-      );
+      // Any signed-in user can read jobs (driver needs Available Jobs + My Jobs)
+      allow read: if signedIn();
 
-      allow create, delete: if signedIn() && isStaff();
+      // Only admin/dispatcher can create jobs
+      allow create: if signedIn() && isAdminOrDispatcher();
 
-      // Staff can update anything.
-      // Drivers can:
-      //  - accept set-price jobs that are new+unassigned
-      //  - update status on their own assigned jobs
+      // Delete jobs only admin/dispatcher
+      allow delete: if signedIn() && isAdminOrDispatcher();
+
+      // Updates allowed if:
+      // - admin/dispatcher
+      // - driver accepting an unassigned new job
+      // - driver updating status on their own job (forward-only)
       allow update: if signedIn() && (
-        isStaff()
-        || driverAcceptingSetJob()
-        || driverUpdatingOwnStatus()
+        isAdminOrDispatcher()
+        || driverAcceptingJob()
+        || driverUpdatingOwnJobStatus()
       );
 
-      function driverAcceptingSetJob() {
+      function driverAcceptingJob() {
         return isDriver()
           && resource.data.status == "new"
           && resource.data.assignedDriverId == null
-          && resource.data.jobType == "set"
           && request.resource.data.assignedDriverId == uid()
-          && request.resource.data.status == "accepted";
+          && request.resource.data.status == "accepted"
+          // prevent driver changing core job details on accept
+          && request.resource.data.jobId == resource.data.jobId
+          && request.resource.data.pickupAddress == resource.data.pickupAddress
+          && request.resource.data.dropoffAddress == resource.data.dropoffAddress
+          && request.resource.data.pickupDate == resource.data.pickupDate
+          && request.resource.data.pickupTime == resource.data.pickupTime
+          && request.resource.data.price == resource.data.price;
       }
 
-      function driverUpdatingOwnStatus() {
+      function driverUpdatingOwnJobStatus() {
         return isDriver()
           && resource.data.assignedDriverId == uid()
-          && request.resource.data.assignedDriverId == uid();
+          && request.resource.data.assignedDriverId == uid()
+          && isValidForwardStatus(resource.data.status, request.resource.data.status);
       }
 
-      // ---------- BIDS (tender jobs) ----------
-      match /bids/{bidId} {
-        // Only staff can read all bids.
-        // Drivers can read only their own bid doc.
-        allow read: if signedIn() && (isStaff() || (isDriver() && bidId == uid()));
+      function isValidForwardStatus(oldStatus, newStatus) {
+        return
+          // allow staying the same (no change)
+          (newStatus == oldStatus)
+          ||
+          // accepted -> started/arrived/pob/completed
+          (oldStatus == "accepted" && (
+            newStatus == "started" ||
+            newStatus == "arrived" ||
+            newStatus == "pob" ||
+            newStatus == "completed"
+          ))
+          ||
+          // started -> arrived/pob/completed
+          (oldStatus == "started" && (
+            newStatus == "arrived" ||
+            newStatus == "pob" ||
+            newStatus == "completed"
+          ))
+          ||
+          // arrived -> pob/completed
+          (oldStatus == "arrived" && (
+            newStatus == "pob" ||
+            newStatus == "completed"
+          ))
+          ||
+          // pob -> completed
+          (oldStatus == "pob" && (
+            newStatus == "completed"
+          ));
+      }
 
-        // Drivers can create/update only their own bid doc,
-        // and only while the job is still new+unassigned+tender.
+      // ---------- JOB BIDS (Tender) ----------
+      // Stored under: /jobs/{jobId}/bids/{driverUid}
+      match /bids/{bidId} {
+
+        // Admin/Dispatcher can read all bids
+        allow read: if signedIn() && isAdminOrDispatcher();
+
+        // Driver can create/update ONLY their own bid document
+        // We enforce:
+        // - bidId must equal the driver's uid
+        // - driverId must match auth uid
+        // - price must be a positive number
         allow create, update: if signedIn()
           && isDriver()
           && bidId == uid()
-          && get(/databases/$(database)/documents/jobs/$(jobId)).data.jobType == "tender"
-          && get(/databases/$(database)/documents/jobs/$(jobId)).data.status == "new"
-          && get(/databases/$(database)/documents/jobs/$(jobId)).data.assignedDriverId == null;
+          && request.resource.data.driverId == uid()
+          && request.resource.data.price is number
+          && request.resource.data.price > 0;
 
-        // Only staff can delete bids (optional)
-        allow delete: if signedIn() && isStaff();
+        // No deleting bids (keeps it simple)
+        allow delete: if false;
       }
     }
   }
 }
+
