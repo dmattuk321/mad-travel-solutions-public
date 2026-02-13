@@ -1,16 +1,18 @@
-# my_app
+# MAD Travel Solutions (Public Example Code)
 
-A new Flutter project.
+This is a sanitized public version of the app.
 
-## Getting Started
+⚠️ Firebase configuration files are NOT included.
 
-This project is a starting point for a Flutter application.
+To run this project yourself:
 
-A few resources to get you started if this is your first Flutter project:
+1. Create your own Firebase project.
+2. Install FlutterFire CLI:
+   dart pub global activate flutterfire_cli
+3. Run:
+   flutterfire configure
+4. This will generate:
+   lib/firebase_options.dart
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+5. Then run:
+   flutter run
