@@ -45,40 +45,57 @@ service cloud.firestore {
     // ---------- JOBS ----------
     match /jobs/{jobId} {
 
-      // Any signed-in user can read jobs
       allow read: if signedIn();
 
-      // Only admin/dispatcher can create jobs
       allow create: if signedIn() && isAdminOrDispatcher();
 
-      // Delete jobs only admin/dispatcher
       allow delete: if signedIn() && isAdminOrDispatcher();
 
-      // Updates allowed if:
-      // - admin/dispatcher
-      // - driver accepting an unassigned new job (fixed price jobs)
-      // - driver updating status on their own job (forward-only)
       allow update: if signedIn() && (
         isAdminOrDispatcher()
-        || driverAcceptingJob()
+        || driverAcceptingFixedJob()
+        || driverConfirmingAwardedTender()
         || driverUpdatingOwnJobStatus()
       );
 
-      function driverAcceptingJob() {
+      // --- Fixed price driver accept ---
+      function driverAcceptingFixedJob() {
         return isDriver()
+          && resource.data.pricingType == "fixed"
           && resource.data.status == "new"
           && resource.data.assignedDriverId == null
           && request.resource.data.assignedDriverId == uid()
           && request.resource.data.status == "accepted"
           // prevent driver changing core job details on accept
-          && request.resource.data.jobId == resource.data.jobId
           && request.resource.data.pickupAddress == resource.data.pickupAddress
           && request.resource.data.dropoffAddress == resource.data.dropoffAddress
           && request.resource.data.pickupDate == resource.data.pickupDate
           && request.resource.data.pickupTime == resource.data.pickupTime
-          && request.resource.data.price == resource.data.price;
+          && request.resource.data.price == resource.data.price
+          && request.resource.data.pricingType == resource.data.pricingType;
       }
 
+      // --- Tender winner confirm/decline within time window ---
+      function driverConfirmingAwardedTender() {
+        return isDriver()
+          && resource.data.pricingType == "tender"
+          && resource.data.status == "award_pending"
+          && resource.data.assignedDriverId == uid()
+          && request.resource.data.assignedDriverId == uid()
+          && request.time < resource.data.awardExpiresAt
+          && (
+            request.resource.data.status == "accepted"
+            || request.resource.data.status == "declined"
+          )
+          // prevent driver editing core job fields during confirm/decline
+          && request.resource.data.pickupAddress == resource.data.pickupAddress
+          && request.resource.data.dropoffAddress == resource.data.dropoffAddress
+          && request.resource.data.pickupDate == resource.data.pickupDate
+          && request.resource.data.pickupTime == resource.data.pickupTime
+          && request.resource.data.pricingType == resource.data.pricingType;
+      }
+
+      // --- After accepted: driver can update only their own job status forward ---
       function driverUpdatingOwnJobStatus() {
         return isDriver()
           && resource.data.assignedDriverId == uid()
@@ -114,27 +131,24 @@ service cloud.firestore {
       }
 
       // ---------- JOB BIDS (Tender) ----------
-      // Stored under: /jobs/{jobId}/bids/{driverUid}
       match /bids/{bidId} {
 
-        function parentJobPath() {
+        function jobPath() {
           return /databases/$(database)/documents/jobs/$(jobId);
         }
 
         function parentIsOpenForBids() {
-          return exists(parentJobPath())
-            && get(parentJobPath()).data.status == "new"
-            && get(parentJobPath()).data.assignedDriverId == null;
+          return exists(jobPath())
+            && get(jobPath()).data.pricingType == "tender"
+            && get(jobPath()).data.status == "new"
+            && get(jobPath()).data.assignedDriverId == null;
         }
 
-        // Admin/Dispatcher can read all bids
-        // Driver can read ONLY their own bid
         allow read: if signedIn() && (
           isAdminOrDispatcher()
           || (isDriver() && bidId == uid())
         );
 
-        // Driver can create/update ONLY their own bid document
         allow create, update: if signedIn()
           && isDriver()
           && parentIsOpenForBids()
