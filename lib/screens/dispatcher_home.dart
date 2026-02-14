@@ -2,6 +2,8 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
+import 'add_job_page.dart';
+
 class DispatcherHome extends StatefulWidget {
   final bool isAdmin;
   const DispatcherHome({super.key, this.isAdmin = false});
@@ -39,7 +41,7 @@ class _DispatcherHomeState extends State<DispatcherHome>
         .snapshots();
   }
 
-  String _s(dynamic v) => (v ?? '').toString();
+  String _s(dynamic v) => (v ?? '').toString().trim();
   double _d(dynamic v) {
     if (v is num) return v.toDouble();
     return double.tryParse(v?.toString() ?? '') ?? 0.0;
@@ -52,11 +54,14 @@ class _DispatcherHomeState extends State<DispatcherHome>
   bool _isTender(Map<String, dynamic> j) => _s(j['pricingType']) == 'tender';
 
   bool _isAssigned(Map<String, dynamic> j) {
-    return j['assignedDriverId'] != null && _s(j['assignedDriverId']).trim().isNotEmpty;
+    final v = j['assignedDriverId'];
+    return v != null && _s(v).isNotEmpty;
   }
 
   bool _isAwardPending(Map<String, dynamic> j) => _s(j['status']) == 'award_pending';
   bool _isDeclined(Map<String, dynamic> j) => _s(j['status']) == 'declined';
+
+  bool get _canAddJobs => true; // admin/dispatcher screen, so yes.
 
   @override
   Widget build(BuildContext context) {
@@ -78,11 +83,28 @@ class _DispatcherHomeState extends State<DispatcherHome>
           ],
         ),
       ),
+
+      // ✅ Add Job Button restored
+      floatingActionButton: _canAddJobs
+          ? FloatingActionButton.extended(
+        onPressed: () async {
+          await Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => const AddJobPage()),
+          );
+        },
+        icon: const Icon(Icons.add),
+        label: const Text('Add Job'),
+      )
+          : null,
+
       body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
         stream: _jobsStream(),
         builder: (context, snapshot) {
           if (snapshot.hasError) return _center('Error: ${snapshot.error}');
-          if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
 
           final docs = snapshot.data!.docs;
 
@@ -92,9 +114,10 @@ class _DispatcherHomeState extends State<DispatcherHome>
               .where((d) => _isNewUnassigned(d.data()) && _isTender(d.data()))
               .toList();
 
-          final acceptedOrPending = docs
-              .where((d) => _isAssigned(d.data()) || _isAwardPending(d.data()) || _isDeclined(d.data()))
-              .toList();
+          final acceptedOrPending = docs.where((d) {
+            final j = d.data();
+            return _isAssigned(j) || _isAwardPending(j) || _isDeclined(j);
+          }).toList();
 
           return TabBarView(
             controller: _tabController,
@@ -154,6 +177,11 @@ class _DispatcherHomeState extends State<DispatcherHome>
         final assignedDriverId = _s(j['assignedDriverId']);
         final assignedDriverName = _s(j['assignedDriverName']);
 
+        final awardedBidPrice = j['awardedBidPrice'];
+        final awardedText = (awardedBidPrice is num)
+            ? '£${awardedBidPrice.toStringAsFixed(2)}'
+            : '';
+
         return Card(
           elevation: 2,
           child: ListTile(
@@ -180,6 +208,8 @@ class _DispatcherHomeState extends State<DispatcherHome>
                     _chip('status: $status'),
                     _chip('type: $pricingType'),
                     if (pricingType == 'fixed') _chip('£${price.toStringAsFixed(2)}'),
+                    if (pricingType == 'tender' && awardedText.isNotEmpty)
+                      _chip('awarded: $awardedText'),
                     if (showDriverChip && assignedDriverId.isNotEmpty)
                       _chip('driver: ${assignedDriverName.isNotEmpty ? assignedDriverName : assignedDriverId}'),
                   ],
@@ -227,7 +257,7 @@ class _DispatcherHomeState extends State<DispatcherHome>
                 _kv('Pickup time', _s(j['pickupTime'])),
                 if (_s(j['pricingType']) == 'fixed')
                   _kv('Price', '£${_d(j['price']).toStringAsFixed(2)}'),
-                if (_s(j['pricingType']) == 'tender' && _s(j['awardedBidPrice']).isNotEmpty)
+                if (_s(j['pricingType']) == 'tender' && j['awardedBidPrice'] != null)
                   _kv('Awarded bid', '£${_d(j['awardedBidPrice']).toStringAsFixed(2)}'),
                 _kv('Driver', _s(j['assignedDriverName']).isNotEmpty ? _s(j['assignedDriverName']) : _s(j['assignedDriverId'])),
                 const SizedBox(height: 16),
@@ -353,9 +383,7 @@ class _DispatcherHomeState extends State<DispatcherHome>
         content: TextField(
           controller: controller,
           keyboardType: TextInputType.number,
-          decoration: const InputDecoration(
-            hintText: 'e.g. 30',
-          ),
+          decoration: const InputDecoration(hintText: 'e.g. 30'),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
@@ -381,7 +409,7 @@ class _DispatcherHomeState extends State<DispatcherHome>
 
     try {
       final userDoc = await FirebaseFirestore.instance.collection('users').doc(driverUid).get();
-      final u = userDoc.data() as Map<String, dynamic>?;
+      final u = userDoc.data();
       final driverName = (u?['name'] ?? u?['email'] ?? driverUid).toString();
 
       final expiresAt = Timestamp.fromDate(DateTime.now().add(Duration(minutes: minutes)));
@@ -397,7 +425,7 @@ class _DispatcherHomeState extends State<DispatcherHome>
       });
 
       if (mounted) {
-        Navigator.pop(context); // close bids sheet
+        Navigator.pop(context);
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Offered to $driverName ($minutes mins)')),
         );

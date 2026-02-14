@@ -14,16 +14,27 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
 
   final _statuses = const ['accepted', 'started', 'arrived', 'pob', 'completed'];
 
+  // One bid text controller per job docId so typing doesn't reset on rebuild
+  final Map<String, TextEditingController> _bidControllers = {};
+
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
   }
 
   @override
   void dispose() {
+    for (final c in _bidControllers.values) {
+      c.dispose();
+    }
+    _bidControllers.clear();
     _tabController.dispose();
     super.dispose();
+  }
+
+  TextEditingController _bidControllerFor(String jobDocId) {
+    return _bidControllers.putIfAbsent(jobDocId, () => TextEditingController());
   }
 
   String _s(dynamic v) => (v ?? '').toString().trim();
@@ -34,6 +45,12 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     final s = v.toString().trim();
     if (s.isEmpty) return '';
     return s.startsWith('£') ? s : '£$s';
+  }
+
+  num? _parsePrice(String input) {
+    final cleaned = input.trim().replaceAll('£', '');
+    if (cleaned.isEmpty) return null;
+    return num.tryParse(cleaned);
   }
 
   String _compactDateTime(Map<String, dynamic> job) {
@@ -49,7 +66,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     final flat = _s(job[key]);
     if (flat.isNotEmpty) return flat;
 
-    final nested = job[key.replaceAll('Address', '')];
+    final nested = job[key.replaceAll('Address', '')]; // pickup / dropoff
     if (nested is Map) {
       final a = _s(nested['address']);
       if (a.isNotEmpty) return a;
@@ -57,6 +74,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     return '';
   }
 
+  // ---------------- FIXED JOB ACCEPT ----------------
   Future<void> _acceptFixedJob(String docId) async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
@@ -72,7 +90,8 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
       final assigned = data['assignedDriverId'];
       final pricingType = _s(data['pricingType']);
 
-      if (pricingType != 'fixed') return;
+      // Only accept if it's a fixed job, new, and unassigned
+      if (pricingType.isNotEmpty && pricingType != 'fixed') return;
       if (currentStatus != 'new') return;
       if (assigned != null) return;
 
@@ -85,22 +104,64 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     });
   }
 
-  Future<void> _confirmTender(String docId, bool accept) async {
-    final ref = FirebaseFirestore.instance.collection('jobs').doc(docId);
+  // ---------------- TENDER BID SUBMIT ----------------
+  Future<void> _submitBid(String jobDocId) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
 
-    await ref.update({
-      'status': accept ? 'accepted' : 'declined',
-      if (accept) 'acceptedAt': FieldValue.serverTimestamp(),
-      if (!accept) 'declinedAt': FieldValue.serverTimestamp(),
-    });
+    final controller = _bidControllerFor(jobDocId);
+    final price = _parsePrice(controller.text);
+
+    if (price == null || price <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter a valid bid price (e.g. 25 or 25.50).')),
+      );
+      return;
+    }
+
+    final jobRef = FirebaseFirestore.instance.collection('jobs').doc(jobDocId);
+
+    // Optional safety check: only allow bids while job is still new/unassigned/tender
+    final jobSnap = await jobRef.get();
+    if (!jobSnap.exists) return;
+    final job = jobSnap.data() as Map<String, dynamic>;
+
+    final status = _s(job['status']);
+    final assigned = job['assignedDriverId'];
+    final pricingType = _s(job['pricingType']);
+
+    if (pricingType != 'tender') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('This job is not a tender job.')),
+      );
+      return;
+    }
+    if (status != 'new' || assigned != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Bidding is closed for this job.')),
+      );
+      return;
+    }
+
+    final bidRef = jobRef.collection('bids').doc(user.uid);
+
+    await bidRef.set({
+      'driverId': user.uid,
+      'price': price,
+      'updatedAt': FieldValue.serverTimestamp(),
+      'createdAt': FieldValue.serverTimestamp(), // harmless if overwriting; rules can allow set
+    }, SetOptions(merge: true));
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Bid submitted: £${price.toStringAsFixed(2)}')),
+    );
   }
 
+  // ---------------- STATUS UPDATES ----------------
   bool _canMoveTo(String current, String target) {
     if (!_statuses.contains(target)) return false;
 
-    if (current == 'new' || current == 'award_pending' || current == 'declined') {
-      return false;
-    }
+    if (current == 'new') return target == 'accepted';
 
     final currentIndex = _statuses.indexOf(current);
     if (currentIndex == -1) return false;
@@ -108,7 +169,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     final targetIndex = _statuses.indexOf(target);
     if (targetIndex == -1) return false;
 
-    return targetIndex >= currentIndex;
+    return targetIndex >= currentIndex; // forward-only (skips allowed)
   }
 
   Future<void> _setStatus(String docId, String targetStatus) async {
@@ -127,20 +188,14 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     });
   }
 
+  // ---------------- UI HELPERS ----------------
   Widget _jobHeaderLine(Map<String, dynamic> job) {
     final dt = _compactDateTime(job);
     final price = _money(job['price']);
-    final pricingType = _s(job['pricingType']);
-    final awardedBid = _money(job['awardedBidPrice']);
 
     final parts = <String>[];
     if (dt.isNotEmpty) parts.add(dt);
-
-    if (pricingType == 'tender' && awardedBid.isNotEmpty) {
-      parts.add('Bid $awardedBid');
-    } else if (price.isNotEmpty) {
-      parts.add(price);
-    }
+    if (price.isNotEmpty) parts.add(price);
 
     return Text(
       parts.isEmpty ? 'Job' : parts.join('  •  '),
@@ -168,9 +223,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
   }
 
   Widget _statusButtons(String docId, String currentStatus) {
-    if (currentStatus == 'new' || currentStatus == 'award_pending' || currentStatus == 'declined') {
-      return const SizedBox.shrink();
-    }
+    if (currentStatus == 'new') return const SizedBox.shrink();
 
     return Wrap(
       spacing: 10,
@@ -187,63 +240,8 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     );
   }
 
-  Widget _awardPendingButtons(String docId, Map<String, dynamic> job) {
-    final expiresAt = job['awardExpiresAt'];
-    DateTime? expires;
-    if (expiresAt is Timestamp) expires = expiresAt.toDate();
-
-    final minutes = _s(job['awardMinutes']);
-    final price = _money(job['awardedBidPrice']);
-
-    String subtitle = '';
-    if (expires != null) {
-      final diff = expires.difference(DateTime.now());
-      final minsLeft = diff.inMinutes;
-      if (minsLeft >= 0) {
-        subtitle = 'Time left: ~${minsLeft} min';
-      } else {
-        subtitle = 'Offer expired (tell dispatch)';
-      }
-    } else if (minutes.isNotEmpty) {
-      subtitle = 'Time limit: $minutes min';
-    }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const SizedBox(height: 10),
-        Text(
-          'You’ve won this tender${price.isNotEmpty ? " ($price)" : ""}. Confirm now:',
-          style: const TextStyle(fontWeight: FontWeight.w700),
-        ),
-        if (subtitle.isNotEmpty) Padding(
-          padding: const EdgeInsets.only(top: 6),
-          child: Text(subtitle),
-        ),
-        const SizedBox(height: 10),
-        Row(
-          children: [
-            Expanded(
-              child: ElevatedButton(
-                onPressed: () => _confirmTender(docId, true),
-                child: const Text('ACCEPT'),
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: OutlinedButton(
-                onPressed: () => _confirmTender(docId, false),
-                child: const Text('DECLINE'),
-              ),
-            ),
-          ],
-        ),
-      ],
-    );
-  }
-
-  // ----------- Available Jobs (only FIXED jobs shown here) -----------
-  Widget _availableJobsTab() {
+  // ---------------- TAB 1: AVAILABLE FIXED ----------------
+  Widget _availableFixedJobsTab() {
     final query = FirebaseFirestore.instance
         .collection('jobs')
         .where('status', isEqualTo: 'new')
@@ -254,13 +252,17 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: query.snapshots(),
       builder: (context, snapshot) {
-        if (snapshot.hasError) return Center(child: Text('Error: ${snapshot.error}'));
+        if (snapshot.hasError) {
+          return Center(child: Text('Error: ${snapshot.error}'));
+        }
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator());
         }
 
         final docs = snapshot.data?.docs ?? [];
-        if (docs.isEmpty) return const Center(child: Text('No available fixed-price jobs right now.'));
+        if (docs.isEmpty) {
+          return const Center(child: Text('No available fixed price jobs right now.'));
+        }
 
         return ListView.builder(
           padding: const EdgeInsets.all(12),
@@ -297,10 +299,85 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     );
   }
 
-  // ----------- My Jobs (includes award_pending / accepted etc) -----------
+  // ---------------- TAB 2: TENDER JOBS ----------------
+  Widget _tenderJobsTab() {
+    final query = FirebaseFirestore.instance
+        .collection('jobs')
+        .where('status', isEqualTo: 'new')
+        .where('assignedDriverId', isNull: true)
+        .where('pricingType', isEqualTo: 'tender')
+        .orderBy('createdAt', descending: true);
+
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: query.snapshots(),
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return Center(child: Text('Error: ${snapshot.error}'));
+        }
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        final docs = snapshot.data?.docs ?? [];
+        if (docs.isEmpty) {
+          return const Center(child: Text('No tender jobs right now.'));
+        }
+
+        return ListView.builder(
+          padding: const EdgeInsets.all(12),
+          itemCount: docs.length,
+          itemBuilder: (context, i) {
+            final doc = docs[i];
+            final job = doc.data();
+            final controller = _bidControllerFor(doc.id);
+
+            return Card(
+              margin: const EdgeInsets.symmetric(vertical: 8),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _jobHeaderLine(job),
+                    const SizedBox(height: 10),
+                    _jobSummary(job),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: controller,
+                            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                            decoration: const InputDecoration(
+                              labelText: 'Your bid (£)',
+                              hintText: 'e.g. 25 or 25.50',
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        ElevatedButton(
+                          onPressed: () => _submitBid(doc.id),
+                          child: const Text('Submit Bid'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // ---------------- TAB 3: MY JOBS ----------------
   Widget _myJobsTab() {
     final user = FirebaseAuth.instance.currentUser;
-    if (user == null) return const Center(child: Text('Not signed in.'));
+    if (user == null) {
+      return const Center(child: Text('Not signed in.'));
+    }
 
     final query = FirebaseFirestore.instance
         .collection('jobs')
@@ -310,13 +387,17 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: query.snapshots(),
       builder: (context, snapshot) {
-        if (snapshot.hasError) return Center(child: Text('Error: ${snapshot.error}'));
+        if (snapshot.hasError) {
+          return Center(child: Text('Error: ${snapshot.error}'));
+        }
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator());
         }
 
         final docs = snapshot.data?.docs ?? [];
-        if (docs.isEmpty) return const Center(child: Text('No jobs assigned to you yet.'));
+        if (docs.isEmpty) {
+          return const Center(child: Text('No jobs assigned to you yet.'));
+        }
 
         return ListView.builder(
           padding: const EdgeInsets.all(12),
@@ -335,19 +416,6 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
                 children: [
                   const SizedBox(height: 8),
                   _jobSummary(job),
-
-                  if (status == 'award_pending')
-                    _awardPendingButtons(doc.id, job),
-
-                  if (status == 'declined')
-                    const Padding(
-                      padding: EdgeInsets.only(top: 10),
-                      child: Text(
-                        'You declined this job. Dispatch will re-offer it.',
-                        style: TextStyle(fontWeight: FontWeight.w600),
-                      ),
-                    ),
-
                   const SizedBox(height: 12),
                   _statusButtons(doc.id, status),
                 ],
@@ -359,6 +427,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     );
   }
 
+  // ---------------- BUILD ----------------
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -373,7 +442,8 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
         bottom: TabBar(
           controller: _tabController,
           tabs: const [
-            Tab(text: 'Available Jobs'),
+            Tab(text: 'Fixed Jobs'),
+            Tab(text: 'Tender Jobs'),
             Tab(text: 'My Jobs'),
           ],
         ),
@@ -381,7 +451,8 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
       body: TabBarView(
         controller: _tabController,
         children: [
-          _availableJobsTab(),
+          _availableFixedJobsTab(),
+          _tenderJobsTab(),
           _myJobsTab(),
         ],
       ),
