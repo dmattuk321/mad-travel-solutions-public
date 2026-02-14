@@ -2,39 +2,23 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    function signedIn() {
-      return request.auth != null;
-    }
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
 
-    function uid() {
-      return request.auth.uid;
-    }
-
-    function userPath() {
-      return /databases/$(database)/documents/users/$(uid());
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(uid()));
     }
 
     function role() {
-      return signedIn() && exists(userPath())
-        ? get(userPath()).data.role
+      return signedIn() && exists(/databases/$(database)/documents/users/$(uid()))
+        ? userDoc().data.role
         : null;
     }
 
-    function isAdmin() {
-      return role() == "admin";
-    }
-
-    function isDispatcher() {
-      return role() == "dispatcher";
-    }
-
-    function isDriver() {
-      return role() == "driver";
-    }
-
-    function isAdminOrDispatcher() {
-      return isAdmin() || isDispatcher();
-    }
+    function isAdmin() { return role() == "admin"; }
+    function isDispatcher() { return role() == "dispatcher"; }
+    function isDriver() { return role() == "driver"; }
+    function isAdminOrDispatcher() { return isAdmin() || isDispatcher(); }
 
     // ---------- USERS ----------
     match /users/{userId} {
@@ -46,27 +30,23 @@ service cloud.firestore {
     match /jobs/{jobId} {
 
       allow read: if signedIn();
-
       allow create: if signedIn() && isAdminOrDispatcher();
-
       allow delete: if signedIn() && isAdminOrDispatcher();
 
       allow update: if signedIn() && (
         isAdminOrDispatcher()
         || driverAcceptingFixedJob()
-        || driverConfirmingAwardedTender()
+        || driverConfirmingOrDecliningOffer()
         || driverUpdatingOwnJobStatus()
       );
 
-      // --- Fixed price driver accept ---
+      // Fixed job accept (driver takes "new" unassigned fixed job)
       function driverAcceptingFixedJob() {
         return isDriver()
-          && resource.data.pricingType == "fixed"
           && resource.data.status == "new"
           && resource.data.assignedDriverId == null
           && request.resource.data.assignedDriverId == uid()
           && request.resource.data.status == "accepted"
-          // prevent driver changing core job details on accept
           && request.resource.data.pickupAddress == resource.data.pickupAddress
           && request.resource.data.dropoffAddress == resource.data.dropoffAddress
           && request.resource.data.pickupDate == resource.data.pickupDate
@@ -75,27 +55,30 @@ service cloud.firestore {
           && request.resource.data.pricingType == resource.data.pricingType;
       }
 
-      // --- Tender winner confirm/decline within time window ---
-      function driverConfirmingAwardedTender() {
+      // Tender offer confirm/decline (driver responds to "offer_pending")
+      function driverConfirmingOrDecliningOffer() {
         return isDriver()
-          && resource.data.pricingType == "tender"
-          && resource.data.status == "award_pending"
+          && resource.data.status == "offer_pending"
           && resource.data.assignedDriverId == uid()
-          && request.resource.data.assignedDriverId == uid()
-          && request.time < resource.data.awardExpiresAt
+          && request.resource.data.pricingType == resource.data.pricingType
+          // ACCEPT path
           && (
-            request.resource.data.status == "accepted"
-            || request.resource.data.status == "declined"
+            (request.resource.data.status == "accepted"
+              && request.resource.data.assignedDriverId == uid())
+            ||
+            // DECLINE path: reset job back to unassigned new
+            (request.resource.data.status == "new"
+              && request.resource.data.assignedDriverId == null)
           )
-          // prevent driver editing core job fields during confirm/decline
+          // prevent driver editing job details while responding
           && request.resource.data.pickupAddress == resource.data.pickupAddress
           && request.resource.data.dropoffAddress == resource.data.dropoffAddress
           && request.resource.data.pickupDate == resource.data.pickupDate
           && request.resource.data.pickupTime == resource.data.pickupTime
-          && request.resource.data.pricingType == resource.data.pricingType;
+          && request.resource.data.price == resource.data.price;
       }
 
-      // --- After accepted: driver can update only their own job status forward ---
+      // Driver can update forward-only statuses AFTER accepted on their job
       function driverUpdatingOwnJobStatus() {
         return isDriver()
           && resource.data.assignedDriverId == uid()
@@ -125,23 +108,21 @@ service cloud.firestore {
             newStatus == "completed"
           ))
           ||
-          (oldStatus == "pob" && (
-            newStatus == "completed"
-          ));
+          (oldStatus == "pob" && ( newStatus == "completed" ));
       }
 
       // ---------- JOB BIDS (Tender) ----------
       match /bids/{bidId} {
 
-        function jobPath() {
-          return /databases/$(database)/documents/jobs/$(jobId);
+        function parentJob() {
+          return get(/databases/$(database)/documents/jobs/$(jobId));
         }
 
         function parentIsOpenForBids() {
-          return exists(jobPath())
-            && get(jobPath()).data.pricingType == "tender"
-            && get(jobPath()).data.status == "new"
-            && get(jobPath()).data.assignedDriverId == null;
+          return exists(/databases/$(database)/documents/jobs/$(jobId))
+            && parentJob().data.status == "new"
+            && parentJob().data.assignedDriverId == null
+            && parentJob().data.pricingType == "tender";
         }
 
         allow read: if signedIn() && (
