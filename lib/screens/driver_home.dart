@@ -72,6 +72,25 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     return '';
   }
 
+  bool _isOfferPendingStatus(String status) {
+    // Support BOTH names while you’re transitioning
+    return status == 'offer_pending' || status == 'award_pending';
+  }
+
+  Timestamp? _getOfferExpiresAt(Map<String, dynamic> job) {
+    final v1 = job['offerExpiresAt'];
+    if (v1 is Timestamp) return v1;
+    final v2 = job['awardExpiresAt'];
+    if (v2 is Timestamp) return v2;
+    return null;
+  }
+
+  bool _offerExpired(Map<String, dynamic> job) {
+    final ts = _getOfferExpiresAt(job);
+    if (ts == null) return false;
+    return ts.toDate().isBefore(DateTime.now());
+  }
+
   // ---------------- FIXED JOB ACCEPT ----------------
   Future<void> _acceptFixedJob(String docId) async {
     final user = FirebaseAuth.instance.currentUser;
@@ -142,6 +161,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
 
     await bidRef.set({
       'driverId': user.uid,
+      'driverName': _s(user.email),
       'price': price,
       'updatedAt': FieldValue.serverTimestamp(),
       'createdAt': FieldValue.serverTimestamp(),
@@ -168,20 +188,21 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
       'assignedDriverId': null,
       'assignedDriverName': null,
       'offerDeclinedAt': FieldValue.serverTimestamp(),
+      // Optional cleanup (safe even if fields don’t exist)
+      'offerExpiresAt': null,
+      'awardExpiresAt': null,
+      'offerMinutes': null,
+      'awardMinutes': null,
     });
-  }
-
-  bool _offerExpired(Map<String, dynamic> job) {
-    final expires = job['offerExpiresAt'];
-    if (expires is Timestamp) {
-      return expires.toDate().isBefore(DateTime.now());
-    }
-    return false;
   }
 
   // ---------------- STATUS UPDATES ----------------
   bool _canMoveTo(String current, String target) {
     if (!_statuses.contains(target)) return false;
+
+    // do NOT allow status buttons when offer is pending
+    if (_isOfferPendingStatus(current)) return false;
+
     if (current == 'new') return target == 'accepted';
 
     final currentIndex = _statuses.indexOf(current);
@@ -243,7 +264,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
   }
 
   Widget _statusButtons(String docId, String currentStatus) {
-    if (currentStatus == 'new' || currentStatus == 'offer_pending') {
+    if (currentStatus == 'new' || _isOfferPendingStatus(currentStatus)) {
       return const SizedBox.shrink();
     }
 
@@ -418,7 +439,9 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
             final doc = docs[i];
             final job = doc.data();
             final status = _s(job['status']).isEmpty ? 'accepted' : _s(job['status']);
-            final expired = status == 'offer_pending' ? _offerExpired(job) : false;
+
+            final isOfferPending = _isOfferPendingStatus(status);
+            final expired = isOfferPending ? _offerExpired(job) : false;
 
             return Card(
               margin: const EdgeInsets.symmetric(vertical: 8),
@@ -430,7 +453,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
                   const SizedBox(height: 8),
                   _jobSummary(job),
 
-                  if (status == 'offer_pending') ...[
+                  if (isOfferPending) ...[
                     const SizedBox(height: 12),
                     Text(
                       expired ? 'Offer expired' : 'Offer pending – please confirm',
@@ -504,3 +527,4 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     );
   }
 }
+
