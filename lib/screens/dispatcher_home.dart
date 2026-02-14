@@ -3,7 +3,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
 class DispatcherHome extends StatefulWidget {
-  final bool isAdmin; // you pass this from AdminHome
+  final bool isAdmin;
   const DispatcherHome({super.key, this.isAdmin = false});
 
   @override
@@ -28,8 +28,6 @@ class _DispatcherHomeState extends State<DispatcherHome>
     super.dispose();
   }
 
-  // We use a single simple query to avoid composite-index pain:
-  // Firestore single-field index on createdAt works by default.
   Stream<QuerySnapshot<Map<String, dynamic>>> _jobsStream() {
     return _jobsRef
         .orderBy('createdAt', descending: true)
@@ -41,7 +39,6 @@ class _DispatcherHomeState extends State<DispatcherHome>
         .snapshots();
   }
 
-  // Helpers
   String _s(dynamic v) => (v ?? '').toString();
   double _d(dynamic v) {
     if (v is num) return v.toDouble();
@@ -52,20 +49,15 @@ class _DispatcherHomeState extends State<DispatcherHome>
     return _s(j['status']) == 'new' && j['assignedDriverId'] == null;
   }
 
-  bool _isTender(Map<String, dynamic> j) {
-    return _s(j['pricingType']) == 'tender';
-  }
-
-  bool _isFixed(Map<String, dynamic> j) {
-    return _s(j['pricingType']) == 'fixed';
-  }
+  bool _isTender(Map<String, dynamic> j) => _s(j['pricingType']) == 'tender';
 
   bool _isAssigned(Map<String, dynamic> j) {
-    return j['assignedDriverId'] != null &&
-        _s(j['assignedDriverId']).trim().isNotEmpty;
+    return j['assignedDriverId'] != null && _s(j['assignedDriverId']).trim().isNotEmpty;
   }
 
-  // UI
+  bool _isAwardPending(Map<String, dynamic> j) => _s(j['status']) == 'award_pending';
+  bool _isDeclined(Map<String, dynamic> j) => _s(j['status']) == 'declined';
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -82,34 +74,27 @@ class _DispatcherHomeState extends State<DispatcherHome>
           tabs: const [
             Tab(text: 'New Jobs'),
             Tab(text: 'Tender Jobs'),
-            Tab(text: 'Accepted Jobs'),
+            Tab(text: 'Accepted / Pending'),
           ],
         ),
       ),
       body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
         stream: _jobsStream(),
         builder: (context, snapshot) {
-          if (snapshot.hasError) {
-            return _centerText('Error: ${snapshot.error}');
-          }
-          if (!snapshot.hasData) {
-            return const Center(child: CircularProgressIndicator());
-          }
+          if (snapshot.hasError) return _center('Error: ${snapshot.error}');
+          if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
 
           final docs = snapshot.data!.docs;
 
-          // Split into tabs by filtering locally (avoids composite index requirements)
-          final newJobs = docs
-              .where((d) => _isNewUnassigned(d.data()))
-              .toList(growable: false);
+          final newJobs = docs.where((d) => _isNewUnassigned(d.data())).toList();
 
           final tenderJobs = docs
               .where((d) => _isNewUnassigned(d.data()) && _isTender(d.data()))
-              .toList(growable: false);
+              .toList();
 
-          final acceptedJobs = docs
-              .where((d) => _isAssigned(d.data()))
-              .toList(growable: false);
+          final acceptedOrPending = docs
+              .where((d) => _isAssigned(d.data()) || _isAwardPending(d.data()) || _isDeclined(d.data()))
+              .toList();
 
           return TabBarView(
             controller: _tabController,
@@ -125,8 +110,8 @@ class _DispatcherHomeState extends State<DispatcherHome>
                 onTap: (doc) => _openTenderBids(doc),
               ),
               _jobsList(
-                jobs: acceptedJobs,
-                emptyText: 'No accepted/assigned jobs yet.',
+                jobs: acceptedOrPending,
+                emptyText: 'No accepted / pending jobs yet.',
                 onTap: (doc) => _openJobDetails(doc),
                 showDriverChip: true,
               ),
@@ -137,7 +122,7 @@ class _DispatcherHomeState extends State<DispatcherHome>
     );
   }
 
-  Widget _centerText(String t) => Center(
+  Widget _center(String t) => Center(
     child: Padding(
       padding: const EdgeInsets.all(16),
       child: Text(t, textAlign: TextAlign.center),
@@ -150,7 +135,7 @@ class _DispatcherHomeState extends State<DispatcherHome>
     required void Function(QueryDocumentSnapshot<Map<String, dynamic>>) onTap,
     bool showDriverChip = false,
   }) {
-    if (jobs.isEmpty) return _centerText(emptyText);
+    if (jobs.isEmpty) return _center(emptyText);
 
     return ListView.separated(
       padding: const EdgeInsets.all(12),
@@ -196,9 +181,7 @@ class _DispatcherHomeState extends State<DispatcherHome>
                     _chip('type: $pricingType'),
                     if (pricingType == 'fixed') _chip('£${price.toStringAsFixed(2)}'),
                     if (showDriverChip && assignedDriverId.isNotEmpty)
-                      _chip(
-                        'driver: ${assignedDriverName.isNotEmpty ? assignedDriverName : assignedDriverId}',
-                      ),
+                      _chip('driver: ${assignedDriverName.isNotEmpty ? assignedDriverName : assignedDriverId}'),
                   ],
                 ),
               ],
@@ -221,7 +204,6 @@ class _DispatcherHomeState extends State<DispatcherHome>
     );
   }
 
-  // ---------- DETAILS ----------
   void _openJobDetails(QueryDocumentSnapshot<Map<String, dynamic>> jobDoc) {
     final j = jobDoc.data();
     showModalBottomSheet(
@@ -235,8 +217,7 @@ class _DispatcherHomeState extends State<DispatcherHome>
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text('Job ${jobDoc.id}',
-                    style: const TextStyle(
-                        fontSize: 18, fontWeight: FontWeight.bold)),
+                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                 const SizedBox(height: 12),
                 _kv('Status', _s(j['status'])),
                 _kv('Pricing type', _s(j['pricingType'])),
@@ -246,11 +227,11 @@ class _DispatcherHomeState extends State<DispatcherHome>
                 _kv('Pickup time', _s(j['pickupTime'])),
                 if (_s(j['pricingType']) == 'fixed')
                   _kv('Price', '£${_d(j['price']).toStringAsFixed(2)}'),
-                _kv('Passengers', _s(j['passengerCount'])),
-                _kv('Flight', _s(j['flightDetails'])),
-                _kv('Notes', _s(j['notes'])),
+                if (_s(j['pricingType']) == 'tender' && _s(j['awardedBidPrice']).isNotEmpty)
+                  _kv('Awarded bid', '£${_d(j['awardedBidPrice']).toStringAsFixed(2)}'),
+                _kv('Driver', _s(j['assignedDriverName']).isNotEmpty ? _s(j['assignedDriverName']) : _s(j['assignedDriverId'])),
                 const SizedBox(height: 16),
-                if (_isTender(j)) ...[
+                if (_isTender(j))
                   ElevatedButton.icon(
                     onPressed: () {
                       Navigator.pop(context);
@@ -259,7 +240,6 @@ class _DispatcherHomeState extends State<DispatcherHome>
                     icon: const Icon(Icons.gavel),
                     label: const Text('View bids'),
                   ),
-                ],
               ],
             ),
           ),
@@ -274,17 +254,13 @@ class _DispatcherHomeState extends State<DispatcherHome>
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SizedBox(
-            width: 120,
-            child: Text(k, style: const TextStyle(fontWeight: FontWeight.w600)),
-          ),
+          SizedBox(width: 120, child: Text(k, style: const TextStyle(fontWeight: FontWeight.w600))),
           Expanded(child: Text(v.isEmpty ? '-' : v)),
         ],
       ),
     );
   }
 
-  // ---------- TENDER: VIEW BIDS + ACCEPT ----------
   void _openTenderBids(QueryDocumentSnapshot<Map<String, dynamic>> jobDoc) {
     final bidsRef = jobDoc.reference.collection('bids');
 
@@ -295,20 +271,15 @@ class _DispatcherHomeState extends State<DispatcherHome>
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
           child: SizedBox(
-            height: MediaQuery.of(context).size.height * 0.75,
+            height: MediaQuery.of(context).size.height * 0.78,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  'Tender Bids',
-                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'Job: ${jobDoc.id}',
-                  style: const TextStyle(fontSize: 12),
-                ),
-                const SizedBox(height: 14),
+                const Text('Tender Bids',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                Text('Job: ${jobDoc.id}', style: const TextStyle(fontSize: 12)),
+                const SizedBox(height: 12),
                 Expanded(
                   child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
                     stream: bidsRef
@@ -319,17 +290,11 @@ class _DispatcherHomeState extends State<DispatcherHome>
                     )
                         .snapshots(),
                     builder: (context, snap) {
-                      if (snap.hasError) {
-                        return _centerText('Error loading bids: ${snap.error}');
-                      }
-                      if (!snap.hasData) {
-                        return const Center(child: CircularProgressIndicator());
-                      }
+                      if (snap.hasError) return _center('Error loading bids: ${snap.error}');
+                      if (!snap.hasData) return const Center(child: CircularProgressIndicator());
 
                       final bidDocs = snap.data!.docs;
-                      if (bidDocs.isEmpty) {
-                        return _centerText('No bids yet.');
-                      }
+                      if (bidDocs.isEmpty) return _center('No bids yet.');
 
                       return ListView.separated(
                         itemCount: bidDocs.length,
@@ -338,67 +303,38 @@ class _DispatcherHomeState extends State<DispatcherHome>
                           final bidDoc = bidDocs[i];
                           final b = bidDoc.data();
 
-                          // IMPORTANT:
-                          // Your rule structure means bidDoc.id is the driver uid
-                          final driverUid = _s(b['driverId']).isNotEmpty
-                              ? _s(b['driverId'])
-                              : bidDoc.id;
-
+                          final driverUid = _s(b['driverId']).isNotEmpty ? _s(b['driverId']) : bidDoc.id;
                           final price = _d(b['price']);
-                          final cachedName = _s(b['driverName']);
-                          final cachedEmail = _s(b['driverEmail']);
 
                           return ListTile(
                             title: FutureBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-                              future: FirebaseFirestore.instance
-                                  .collection('users')
-                                  .doc(driverUid)
-                                  .withConverter<Map<String, dynamic>>(
-                                fromFirestore: (snap, _) => snap.data() ?? <String, dynamic>{},
-                                toFirestore: (data, _) => data,
-                              )
-                                  .get(),
+                              future: FirebaseFirestore.instance.collection('users').doc(driverUid).get(),
                               builder: (context, userSnap) {
-                                String display = '';
-
-                                if (cachedName.isNotEmpty) display = cachedName;
-                                else if (cachedEmail.isNotEmpty) display = cachedEmail;
-
-                                if (display.isEmpty && userSnap.hasData && userSnap.data!.exists) {
-                                  final u = userSnap.data!.data() ?? {};
-                                  final name = _s(u['name']);
-                                  final email = _s(u['email']);
-                                  display = name.isNotEmpty ? name : (email.isNotEmpty ? email : '');
+                                if (userSnap.hasData && userSnap.data!.exists) {
+                                  final u = userSnap.data!.data() as Map<String, dynamic>?;
+                                  final name = (u?['name'] ?? '').toString();
+                                  final email = (u?['email'] ?? '').toString();
+                                  final display = name.isNotEmpty ? name : (email.isNotEmpty ? email : driverUid);
+                                  return Text(display, maxLines: 1, overflow: TextOverflow.ellipsis);
                                 }
-
-                                if (display.isEmpty) display = driverUid;
-
-                                return Text(display, maxLines: 1, overflow: TextOverflow.ellipsis);
+                                return Text(driverUid, maxLines: 1, overflow: TextOverflow.ellipsis);
                               },
                             ),
-                            subtitle: Text('Driver UID: $driverUid'),
-                            trailing: Wrap(
-                              spacing: 10,
-                              crossAxisAlignment: WrapCrossAlignment.center,
-                              children: [
-                                Text('£${price.toStringAsFixed(2)}',
-                                    style: const TextStyle(fontWeight: FontWeight.w700)),
-                                ElevatedButton(
-                                  onPressed: () => _acceptTenderBid(
-                                    jobDoc: jobDoc,
-                                    driverUid: driverUid,
-                                    bidPrice: price,
-                                  ),
-                                  child: const Text('Accept'),
-                                ),
-                              ],
+                            subtitle: Text('£${price.toStringAsFixed(2)}  •  $driverUid'),
+                            trailing: ElevatedButton(
+                              onPressed: () => _awardTenderWithTimeLimit(
+                                jobDoc: jobDoc,
+                                driverUid: driverUid,
+                                bidPrice: price,
+                              ),
+                              child: const Text('Offer'),
                             ),
                           );
                         },
                       );
                     },
                   ),
-                ),
+                )
               ],
             ),
           ),
@@ -407,35 +343,69 @@ class _DispatcherHomeState extends State<DispatcherHome>
     );
   }
 
-  Future<void> _acceptTenderBid({
+  Future<int?> _promptMinutes() async {
+    final controller = TextEditingController(text: '30');
+
+    return showDialog<int>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Time limit (minutes)'),
+        content: TextField(
+          controller: controller,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            hintText: 'e.g. 30',
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () {
+              final minutes = int.tryParse(controller.text.trim());
+              Navigator.pop(context, (minutes != null && minutes > 0) ? minutes : null);
+            },
+            child: const Text('Confirm'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _awardTenderWithTimeLimit({
     required QueryDocumentSnapshot<Map<String, dynamic>> jobDoc,
     required String driverUid,
     required double bidPrice,
   }) async {
+    final minutes = await _promptMinutes();
+    if (minutes == null) return;
+
     try {
       final userDoc = await FirebaseFirestore.instance.collection('users').doc(driverUid).get();
       final u = userDoc.data() as Map<String, dynamic>?;
       final driverName = (u?['name'] ?? u?['email'] ?? driverUid).toString();
 
+      final expiresAt = Timestamp.fromDate(DateTime.now().add(Duration(minutes: minutes)));
+
       await jobDoc.reference.update({
         'assignedDriverId': driverUid,
         'assignedDriverName': driverName,
-        'status': 'accepted',
-        // If you want tender to become a fixed agreed price:
-        'price': bidPrice,
-        'acceptedAt': FieldValue.serverTimestamp(),
+        'status': 'award_pending',
+        'awardMinutes': minutes,
+        'awardExpiresAt': expiresAt,
+        'awardedBidPrice': bidPrice,
+        'awardedAt': FieldValue.serverTimestamp(),
       });
 
       if (mounted) {
         Navigator.pop(context); // close bids sheet
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Accepted bid (£${bidPrice.toStringAsFixed(2)}) for $driverName')),
+          SnackBar(content: Text('Offered to $driverName ($minutes mins)')),
         );
       }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to accept bid: $e')),
+          SnackBar(content: Text('Failed to offer: $e')),
         );
       }
     }

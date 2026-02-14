@@ -36,19 +36,6 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     return s.startsWith('£') ? s : '£$s';
   }
 
-  num? _parsePrice(String input) {
-    final cleaned = input.replaceAll('£', '').trim();
-    if (cleaned.isEmpty) return null;
-    return num.tryParse(cleaned);
-  }
-
-  bool _isTender(Map<String, dynamic> job) {
-    final pt = _s(job['pricingType']).toLowerCase(); // "fixed" or "tender"
-    if (pt == 'tender') return true;
-    if (job['isTender'] == true) return true; // backward compat
-    return false;
-  }
-
   String _compactDateTime(Map<String, dynamic> job) {
     final date = _s(job['pickupDate']);
     final time = _s(job['pickupTime']);
@@ -62,7 +49,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     final flat = _s(job[key]);
     if (flat.isNotEmpty) return flat;
 
-    final nested = job[key.replaceAll('Address', '')]; // pickup / dropoff
+    final nested = job[key.replaceAll('Address', '')];
     if (nested is Map) {
       final a = _s(nested['address']);
       if (a.isNotEmpty) return a;
@@ -70,81 +57,50 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     return '';
   }
 
-  Future<void> _acceptJob(String docId) async {
+  Future<void> _acceptFixedJob(String docId) async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
 
     final ref = FirebaseFirestore.instance.collection('jobs').doc(docId);
 
-    try {
-      await FirebaseFirestore.instance.runTransaction((tx) async {
-        final snap = await tx.get(ref);
-        if (!snap.exists) return;
+    await FirebaseFirestore.instance.runTransaction((tx) async {
+      final snap = await tx.get(ref);
+      if (!snap.exists) return;
 
-        final data = snap.data() as Map<String, dynamic>;
-        final currentStatus = _s(data['status']);
-        final assigned = data['assignedDriverId'];
+      final data = snap.data() as Map<String, dynamic>;
+      final currentStatus = _s(data['status']);
+      final assigned = data['assignedDriverId'];
+      final pricingType = _s(data['pricingType']);
 
-        // Only accept if truly unassigned & new
-        if (currentStatus != 'new') return;
-        if (assigned != null) return;
+      if (pricingType != 'fixed') return;
+      if (currentStatus != 'new') return;
+      if (assigned != null) return;
 
-        tx.update(ref, {
-          'assignedDriverId': user.uid,
-          'assignedDriverName': _s(user.email),
-          'status': 'accepted',
-          'acceptedAt': FieldValue.serverTimestamp(),
-        });
+      tx.update(ref, {
+        'assignedDriverId': user.uid,
+        'assignedDriverName': _s(user.email),
+        'status': 'accepted',
+        'acceptedAt': FieldValue.serverTimestamp(),
       });
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Accept failed: $e')),
-        );
-      }
-    }
+    });
   }
 
-  Future<void> _submitBid({
-    required String jobId,
-    required num price,
-  }) async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) return;
+  Future<void> _confirmTender(String docId, bool accept) async {
+    final ref = FirebaseFirestore.instance.collection('jobs').doc(docId);
 
-    final bidRef = FirebaseFirestore.instance
-        .collection('jobs')
-        .doc(jobId)
-        .collection('bids')
-        .doc(user.uid);
-
-    try {
-      await bidRef.set({
-        'driverId': user.uid,
-        'driverName': _s(user.email),
-        'price': price,
-        'updatedAt': FieldValue.serverTimestamp(),
-        'createdAt': FieldValue.serverTimestamp(), // overwritten first time, harmless later
-      }, SetOptions(merge: true));
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Bid submitted: £${price.toStringAsFixed(2)}')),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Bid failed: $e')),
-        );
-      }
-    }
+    await ref.update({
+      'status': accept ? 'accepted' : 'declined',
+      if (accept) 'acceptedAt': FieldValue.serverTimestamp(),
+      if (!accept) 'declinedAt': FieldValue.serverTimestamp(),
+    });
   }
 
   bool _canMoveTo(String current, String target) {
     if (!_statuses.contains(target)) return false;
 
-    if (current == 'new') return target == 'accepted';
+    if (current == 'new' || current == 'award_pending' || current == 'declined') {
+      return false;
+    }
 
     final currentIndex = _statuses.indexOf(current);
     if (currentIndex == -1) return false;
@@ -165,27 +121,26 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
       'completed': 'completedAt',
     }[targetStatus];
 
-    try {
-      await ref.update({
-        'status': targetStatus,
-        if (tsField != null) tsField: FieldValue.serverTimestamp(),
-      });
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Status update failed: $e')),
-        );
-      }
-    }
+    await ref.update({
+      'status': targetStatus,
+      if (tsField != null) tsField: FieldValue.serverTimestamp(),
+    });
   }
 
   Widget _jobHeaderLine(Map<String, dynamic> job) {
     final dt = _compactDateTime(job);
     final price = _money(job['price']);
+    final pricingType = _s(job['pricingType']);
+    final awardedBid = _money(job['awardedBidPrice']);
 
     final parts = <String>[];
     if (dt.isNotEmpty) parts.add(dt);
-    if (price.isNotEmpty) parts.add(price);
+
+    if (pricingType == 'tender' && awardedBid.isNotEmpty) {
+      parts.add('Bid $awardedBid');
+    } else if (price.isNotEmpty) {
+      parts.add(price);
+    }
 
     return Text(
       parts.isEmpty ? 'Job' : parts.join('  •  '),
@@ -213,7 +168,9 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
   }
 
   Widget _statusButtons(String docId, String currentStatus) {
-    if (currentStatus == 'new') return const SizedBox.shrink();
+    if (currentStatus == 'new' || currentStatus == 'award_pending' || currentStatus == 'declined') {
+      return const SizedBox.shrink();
+    }
 
     return Wrap(
       spacing: 10,
@@ -230,28 +187,80 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     );
   }
 
-  // ---------------- Available Jobs ----------------
+  Widget _awardPendingButtons(String docId, Map<String, dynamic> job) {
+    final expiresAt = job['awardExpiresAt'];
+    DateTime? expires;
+    if (expiresAt is Timestamp) expires = expiresAt.toDate();
+
+    final minutes = _s(job['awardMinutes']);
+    final price = _money(job['awardedBidPrice']);
+
+    String subtitle = '';
+    if (expires != null) {
+      final diff = expires.difference(DateTime.now());
+      final minsLeft = diff.inMinutes;
+      if (minsLeft >= 0) {
+        subtitle = 'Time left: ~${minsLeft} min';
+      } else {
+        subtitle = 'Offer expired (tell dispatch)';
+      }
+    } else if (minutes.isNotEmpty) {
+      subtitle = 'Time limit: $minutes min';
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 10),
+        Text(
+          'You’ve won this tender${price.isNotEmpty ? " ($price)" : ""}. Confirm now:',
+          style: const TextStyle(fontWeight: FontWeight.w700),
+        ),
+        if (subtitle.isNotEmpty) Padding(
+          padding: const EdgeInsets.only(top: 6),
+          child: Text(subtitle),
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Expanded(
+              child: ElevatedButton(
+                onPressed: () => _confirmTender(docId, true),
+                child: const Text('ACCEPT'),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: OutlinedButton(
+                onPressed: () => _confirmTender(docId, false),
+                child: const Text('DECLINE'),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  // ----------- Available Jobs (only FIXED jobs shown here) -----------
   Widget _availableJobsTab() {
     final query = FirebaseFirestore.instance
         .collection('jobs')
         .where('status', isEqualTo: 'new')
         .where('assignedDriverId', isNull: true)
+        .where('pricingType', isEqualTo: 'fixed')
         .orderBy('createdAt', descending: true);
 
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: query.snapshots(),
       builder: (context, snapshot) {
-        if (snapshot.hasError) {
-          return Center(child: Text('Error: ${snapshot.error}'));
-        }
+        if (snapshot.hasError) return Center(child: Text('Error: ${snapshot.error}'));
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator());
         }
 
         final docs = snapshot.data?.docs ?? [];
-        if (docs.isEmpty) {
-          return const Center(child: Text('No available jobs right now.'));
-        }
+        if (docs.isEmpty) return const Center(child: Text('No available fixed-price jobs right now.'));
 
         return ListView.builder(
           padding: const EdgeInsets.all(12),
@@ -259,7 +268,6 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
           itemBuilder: (context, i) {
             final doc = docs[i];
             final job = doc.data();
-            final tender = _isTender(job);
 
             return Card(
               margin: const EdgeInsets.symmetric(vertical: 8),
@@ -272,21 +280,13 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
                     const SizedBox(height: 10),
                     _jobSummary(job),
                     const SizedBox(height: 12),
-
-                    if (!tender)
-                      Align(
-                        alignment: Alignment.centerRight,
-                        child: ElevatedButton(
-                          onPressed: () => _acceptJob(doc.id),
-                          child: const Text('Accept Job'),
-                        ),
-                      )
-                    else
-                      _TenderBidBox(
-                        jobId: doc.id,
-                        onSubmit: (price) => _submitBid(jobId: doc.id, price: price),
-                        parsePrice: _parsePrice,
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: ElevatedButton(
+                        onPressed: () => _acceptFixedJob(doc.id),
+                        child: const Text('Accept Job'),
                       ),
+                    ),
                   ],
                 ),
               ),
@@ -297,12 +297,10 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     );
   }
 
-  // ---------------- My Jobs ----------------
+  // ----------- My Jobs (includes award_pending / accepted etc) -----------
   Widget _myJobsTab() {
     final user = FirebaseAuth.instance.currentUser;
-    if (user == null) {
-      return const Center(child: Text('Not signed in.'));
-    }
+    if (user == null) return const Center(child: Text('Not signed in.'));
 
     final query = FirebaseFirestore.instance
         .collection('jobs')
@@ -312,17 +310,13 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: query.snapshots(),
       builder: (context, snapshot) {
-        if (snapshot.hasError) {
-          return Center(child: Text('Error: ${snapshot.error}'));
-        }
+        if (snapshot.hasError) return Center(child: Text('Error: ${snapshot.error}'));
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator());
         }
 
         final docs = snapshot.data?.docs ?? [];
-        if (docs.isEmpty) {
-          return const Center(child: Text('No jobs assigned to you yet.'));
-        }
+        if (docs.isEmpty) return const Center(child: Text('No jobs assigned to you yet.'));
 
         return ListView.builder(
           padding: const EdgeInsets.all(12),
@@ -341,6 +335,19 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
                 children: [
                   const SizedBox(height: 8),
                   _jobSummary(job),
+
+                  if (status == 'award_pending')
+                    _awardPendingButtons(doc.id, job),
+
+                  if (status == 'declined')
+                    const Padding(
+                      padding: EdgeInsets.only(top: 10),
+                      child: Text(
+                        'You declined this job. Dispatch will re-offer it.',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                    ),
+
                   const SizedBox(height: 12),
                   _statusButtons(doc.id, status),
                 ],
@@ -378,108 +385,6 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
           _myJobsTab(),
         ],
       ),
-    );
-  }
-}
-
-class _TenderBidBox extends StatefulWidget {
-  final String jobId;
-  final Future<void> Function(num price) onSubmit;
-  final num? Function(String input) parsePrice;
-
-  const _TenderBidBox({
-    required this.jobId,
-    required this.onSubmit,
-    required this.parsePrice,
-  });
-
-  @override
-  State<_TenderBidBox> createState() => _TenderBidBoxState();
-}
-
-class _TenderBidBoxState extends State<_TenderBidBox> {
-  final _controller = TextEditingController();
-  bool _busy = false;
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final user = FirebaseAuth.instance.currentUser;
-
-    if (user == null) {
-      return const Text('Not signed in.');
-    }
-
-    final bidDocStream = FirebaseFirestore.instance
-        .collection('jobs')
-        .doc(widget.jobId)
-        .collection('bids')
-        .doc(user.uid)
-        .snapshots();
-
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: bidDocStream,
-      builder: (context, snap) {
-        final hasBid = snap.data?.exists ?? false;
-        final bidData = snap.data?.data();
-        final bidPrice = bidData?['price'];
-
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            if (hasBid && bidPrice != null)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 8),
-                child: Text(
-                  'Your bid: £${(bidPrice as num).toStringAsFixed(2)}',
-                  style: const TextStyle(fontWeight: FontWeight.w600),
-                ),
-              ),
-
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _controller,
-                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                    decoration: const InputDecoration(
-                      labelText: 'Your price (£)',
-                      border: OutlineInputBorder(),
-                      isDense: true,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 10),
-                ElevatedButton(
-                  onPressed: _busy
-                      ? null
-                      : () async {
-                    final parsed = widget.parsePrice(_controller.text);
-                    if (parsed == null || parsed <= 0) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('Enter a valid price')),
-                      );
-                      return;
-                    }
-                    setState(() => _busy = true);
-                    try {
-                      await widget.onSubmit(parsed);
-                    } finally {
-                      if (mounted) setState(() => _busy = false);
-                    }
-                  },
-                  child: Text(hasBid ? 'Update Bid' : 'Submit Bid'),
-                ),
-              ],
-            ),
-          ],
-        );
-      },
     );
   }
 }
