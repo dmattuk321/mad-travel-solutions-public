@@ -10,12 +10,14 @@ service cloud.firestore {
       return request.auth.uid;
     }
 
-    function userDoc() {
-      return get(/databases/$(database)/documents/users/$(uid()));
+    function userPath() {
+      return /databases/$(database)/documents/users/$(uid());
     }
 
     function role() {
-      return signedIn() && userDoc().exists() ? userDoc().data.role : null;
+      return signedIn() && exists(userPath())
+        ? get(userPath()).data.role
+        : null;
     }
 
     function isAdmin() {
@@ -115,14 +117,14 @@ service cloud.firestore {
       // Stored under: /jobs/{jobId}/bids/{driverUid}
       match /bids/{bidId} {
 
-        function parentJob() {
-          return get(/databases/$(database)/documents/jobs/$(jobId));
+        function parentJobPath() {
+          return /databases/$(database)/documents/jobs/$(jobId);
         }
 
         function parentIsOpenForBids() {
-          return parentJob().exists()
-            && parentJob().data.status == "new"
-            && parentJob().data.assignedDriverId == null;
+          return exists(parentJobPath())
+            && get(parentJobPath()).data.status == "new"
+            && get(parentJobPath()).data.assignedDriverId == null;
         }
 
         // Admin/Dispatcher can read all bids
@@ -141,7 +143,6 @@ service cloud.firestore {
           && request.resource.data.price is number
           && request.resource.data.price > 0;
 
-        // No deleting bids
         allow delete: if false;
       }
     }
