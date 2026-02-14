@@ -13,8 +13,6 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
   late final TabController _tabController;
 
   final _statuses = const ['accepted', 'started', 'arrived', 'pob', 'completed'];
-
-  // One bid text controller per job docId so typing doesn't reset on rebuild
   final Map<String, TextEditingController> _bidControllers = {};
 
   @override
@@ -66,7 +64,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     final flat = _s(job[key]);
     if (flat.isNotEmpty) return flat;
 
-    final nested = job[key.replaceAll('Address', '')]; // pickup / dropoff
+    final nested = job[key.replaceAll('Address', '')];
     if (nested is Map) {
       final a = _s(nested['address']);
       if (a.isNotEmpty) return a;
@@ -90,7 +88,6 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
       final assigned = data['assignedDriverId'];
       final pricingType = _s(data['pricingType']);
 
-      // Only accept if it's a fixed job, new, and unassigned
       if (pricingType.isNotEmpty && pricingType != 'fixed') return;
       if (currentStatus != 'new') return;
       if (assigned != null) return;
@@ -120,12 +117,10 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     }
 
     final jobRef = FirebaseFirestore.instance.collection('jobs').doc(jobDocId);
-
-    // Optional safety check: only allow bids while job is still new/unassigned/tender
     final jobSnap = await jobRef.get();
     if (!jobSnap.exists) return;
-    final job = jobSnap.data() as Map<String, dynamic>;
 
+    final job = jobSnap.data() as Map<String, dynamic>;
     final status = _s(job['status']);
     final assigned = job['assignedDriverId'];
     final pricingType = _s(job['pricingType']);
@@ -149,7 +144,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
       'driverId': user.uid,
       'price': price,
       'updatedAt': FieldValue.serverTimestamp(),
-      'createdAt': FieldValue.serverTimestamp(), // harmless if overwriting; rules can allow set
+      'createdAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
 
     ScaffoldMessenger.of(context).showSnackBar(
@@ -157,10 +152,36 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     );
   }
 
+  // ---------------- OFFER CONFIRM / DECLINE ----------------
+  Future<void> _acceptOffer(String jobDocId) async {
+    final ref = FirebaseFirestore.instance.collection('jobs').doc(jobDocId);
+    await ref.update({
+      'status': 'accepted',
+      'offerAcceptedAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  Future<void> _declineOffer(String jobDocId) async {
+    final ref = FirebaseFirestore.instance.collection('jobs').doc(jobDocId);
+    await ref.update({
+      'status': 'new',
+      'assignedDriverId': null,
+      'assignedDriverName': null,
+      'offerDeclinedAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  bool _offerExpired(Map<String, dynamic> job) {
+    final expires = job['offerExpiresAt'];
+    if (expires is Timestamp) {
+      return expires.toDate().isBefore(DateTime.now());
+    }
+    return false;
+  }
+
   // ---------------- STATUS UPDATES ----------------
   bool _canMoveTo(String current, String target) {
     if (!_statuses.contains(target)) return false;
-
     if (current == 'new') return target == 'accepted';
 
     final currentIndex = _statuses.indexOf(current);
@@ -169,7 +190,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     final targetIndex = _statuses.indexOf(target);
     if (targetIndex == -1) return false;
 
-    return targetIndex >= currentIndex; // forward-only (skips allowed)
+    return targetIndex >= currentIndex;
   }
 
   Future<void> _setStatus(String docId, String targetStatus) async {
@@ -192,7 +213,6 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
   Widget _jobHeaderLine(Map<String, dynamic> job) {
     final dt = _compactDateTime(job);
     final price = _money(job['price']);
-
     final parts = <String>[];
     if (dt.isNotEmpty) parts.add(dt);
     if (price.isNotEmpty) parts.add(price);
@@ -223,7 +243,9 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
   }
 
   Widget _statusButtons(String docId, String currentStatus) {
-    if (currentStatus == 'new') return const SizedBox.shrink();
+    if (currentStatus == 'new' || currentStatus == 'offer_pending') {
+      return const SizedBox.shrink();
+    }
 
     return Wrap(
       spacing: 10,
@@ -240,7 +262,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     );
   }
 
-  // ---------------- TAB 1: AVAILABLE FIXED ----------------
+  // ---------------- TAB 1: FIXED ----------------
   Widget _availableFixedJobsTab() {
     final query = FirebaseFirestore.instance
         .collection('jobs')
@@ -252,9 +274,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: query.snapshots(),
       builder: (context, snapshot) {
-        if (snapshot.hasError) {
-          return Center(child: Text('Error: ${snapshot.error}'));
-        }
+        if (snapshot.hasError) return Center(child: Text('Error: ${snapshot.error}'));
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator());
         }
@@ -299,7 +319,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     );
   }
 
-  // ---------------- TAB 2: TENDER JOBS ----------------
+  // ---------------- TAB 2: TENDER ----------------
   Widget _tenderJobsTab() {
     final query = FirebaseFirestore.instance
         .collection('jobs')
@@ -311,9 +331,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: query.snapshots(),
       builder: (context, snapshot) {
-        if (snapshot.hasError) {
-          return Center(child: Text('Error: ${snapshot.error}'));
-        }
+        if (snapshot.hasError) return Center(child: Text('Error: ${snapshot.error}'));
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator());
         }
@@ -375,9 +393,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
   // ---------------- TAB 3: MY JOBS ----------------
   Widget _myJobsTab() {
     final user = FirebaseAuth.instance.currentUser;
-    if (user == null) {
-      return const Center(child: Text('Not signed in.'));
-    }
+    if (user == null) return const Center(child: Text('Not signed in.'));
 
     final query = FirebaseFirestore.instance
         .collection('jobs')
@@ -387,17 +403,13 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: query.snapshots(),
       builder: (context, snapshot) {
-        if (snapshot.hasError) {
-          return Center(child: Text('Error: ${snapshot.error}'));
-        }
+        if (snapshot.hasError) return Center(child: Text('Error: ${snapshot.error}'));
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator());
         }
 
         final docs = snapshot.data?.docs ?? [];
-        if (docs.isEmpty) {
-          return const Center(child: Text('No jobs assigned to you yet.'));
-        }
+        if (docs.isEmpty) return const Center(child: Text('No jobs assigned to you yet.'));
 
         return ListView.builder(
           padding: const EdgeInsets.all(12),
@@ -406,6 +418,7 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
             final doc = docs[i];
             final job = doc.data();
             final status = _s(job['status']).isEmpty ? 'accepted' : _s(job['status']);
+            final expired = status == 'offer_pending' ? _offerExpired(job) : false;
 
             return Card(
               margin: const EdgeInsets.symmetric(vertical: 8),
@@ -416,6 +429,38 @@ class _DriverHomeState extends State<DriverHome> with SingleTickerProviderStateM
                 children: [
                   const SizedBox(height: 8),
                   _jobSummary(job),
+
+                  if (status == 'offer_pending') ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      expired ? 'Offer expired' : 'Offer pending – please confirm',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        color: expired ? Colors.red : null,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            onPressed: expired ? null : () => _acceptOffer(doc.id),
+                            icon: const Icon(Icons.check),
+                            label: const Text('Accept Offer'),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: () => _declineOffer(doc.id),
+                            icon: const Icon(Icons.close),
+                            label: const Text('Decline Offer'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+
                   const SizedBox(height: 12),
                   _statusButtons(doc.id, status),
                 ],
